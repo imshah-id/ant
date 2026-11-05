@@ -3,6 +3,7 @@ package dialect_test
 import (
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"testing"
 	"time"
 
@@ -64,6 +65,8 @@ func TestTimesBindInUTC(t *testing.T) {
 
 	var nilPointer *time.Time
 
+	var nilNumber *int
+
 	calls := 0
 	other := counted{&calls}
 
@@ -87,6 +90,8 @@ func TestTimesBindInUTC(t *testing.T) {
 		{"**sql.NullTime", &nullTime, utc},
 		{"a pointer to a nil *time.Time", &nilPointer, &nilPointer},
 		{"**qb.Secret", ptrTo(&qb.Secret{V: at}), &qb.Secret{V: utc}},
+		{"a pointer to a nil *int", &nilNumber, &nilNumber},
+		{"nil *int", nilNumber, nilNumber},
 		{"not a time", 42, 42},
 	}
 
@@ -230,26 +235,75 @@ func TestOddValuers(t *testing.T) {
 
 func ptrTo[V any](v V) *V { return &v }
 
-// A Valuer built on a time, behind a pointer to a pointer, is asked once, and
-// what it gives, an error too, goes on.
+var errRefused = errors.New("refused")
+
+// refused is built on sql.NullTime but fails, counting its calls.
+type refused struct {
+	sql.NullTime
+	calls *int
+}
+
+func (r refused) Value() (driver.Value, error) {
+	*r.calls++
+
+	return nil, errRefused
+}
+
+// A Valuer built on a time, behind any number of pointers, is asked once on its
+// way to the driver, and what it gives, an error too, goes on.
 func TestPointedValuersAreAskedOnce(t *testing.T) {
 	calls := 0
-	inner := &overridden{calls: &calls}
+	text := &overridden{calls: &calls}
+	failing := &refused{calls: &calls}
 
-	for _, d := range []dialect.Dialect{sqlite.Dialect, sqlserver.Dialect} {
-		_, args, err := d.Render(
-			&qb.Select{Columns: []qb.Selected{{Value: qb.Param{Value: &inner}}}},
-		)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if args[0] != "text" {
-			t.Errorf("%s: bound %#v", d.Name(), args[0])
-		}
+	cases := []struct {
+		in   any
+		want any
+		err  error
+	}{
+		{&text, "text", nil},
+		{ptrTo(&text), "text", nil},
+		{&failing, nil, errRefused},
+		{ptrTo(&failing), nil, errRefused},
 	}
 
-	if calls != 2 {
-		t.Errorf("Value ran %d times for two renders", calls)
+	for _, d := range []dialect.Dialect{sqlite.Dialect, sqlserver.Dialect} {
+		for _, tt := range cases {
+			calls = 0
+
+			_, rendered, err := d.Render(
+				&qb.Select{Columns: []qb.Selected{{Value: qb.Param{Value: tt.in}}}},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, bound, err := dialect.Bind(d, "SELECT ?", []any{tt.in})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if calls != 2 {
+				t.Errorf("%s: %T was asked %d times to bind twice", d.Name(), tt.in, calls)
+			}
+
+			for _, arg := range []any{rendered[0], bound[0]} {
+				calls = 0
+
+				// database/sql converts the argument as the driver gets it.
+				got, err := driver.DefaultParameterConverter.ConvertValue(arg)
+
+				if got != tt.want || !errors.Is(err, tt.err) || calls != 0 {
+					t.Errorf(
+						"%s: %T went on as %#v, %v, asked %d more times",
+						d.Name(),
+						tt.in,
+						got,
+						err,
+						calls,
+					)
+				}
+			}
+		}
 	}
 }

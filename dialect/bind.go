@@ -102,24 +102,39 @@ func utc(v any) any {
 
 		return value
 	default:
-		// database/sql follows pointers to the value, so ant does too, and a
-		// time found at the end goes on in place of the chain.
+		// database/sql follows pointers, however many, to the first Valuer or
+		// value, so ant does too, and a time found there goes on in place of
+		// the chain.
 		rv := reflect.ValueOf(v)
-		if rv.Kind() == reflect.Pointer && !rv.IsNil() {
-			elem := rv.Elem().Interface()
-			out := utc(elem)
+		if rv.Kind() != reflect.Pointer {
+			return v
+		}
 
-			// A Valuer down the chain was asked already, so what it gave goes on,
-			// NULL and errors included, rather than having it asked again.
-			if valuer, ok := elem.(driver.Valuer); ok && valuer != nil &&
-				holdsTime(reflect.TypeOf(elem), nil) {
-				return out
-			}
+		for rv.Kind() == reflect.Pointer && !rv.IsNil() {
+			rv = rv.Elem()
 
-			switch out.(type) {
-			case time.Time, qb.Secret, *qb.Secret:
-				return out
+			if _, ok := rv.Interface().(driver.Valuer); ok {
+				break
 			}
+		}
+
+		// A nil pointer is NULL to database/sql, Valuer or not.
+		if rv.Kind() == reflect.Pointer && rv.IsNil() {
+			return v
+		}
+
+		elem := rv.Interface()
+		out := utc(elem)
+
+		// A Valuer at the end was asked already, so what it gave goes on, NULL
+		// and errors included, rather than having it asked again.
+		if _, ok := elem.(driver.Valuer); ok && holdsTime(rv.Type(), nil) {
+			return out
+		}
+
+		switch out.(type) {
+		case time.Time, qb.Secret, *qb.Secret:
+			return out
 		}
 	}
 
