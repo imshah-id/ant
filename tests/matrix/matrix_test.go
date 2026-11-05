@@ -24,7 +24,8 @@ import (
 var known = []*knownFailure{
 	{pattern: `/Union_of_paged_sides/`, issue: "#8, fixed by PR #16"},
 	{pattern: `^TestMatrix/(mysql|mariadb)/.*/offset_3/(Update|Delete)$`, issue: "#22"},
-	{pattern: `^TestMatrix/sqlserver/FromCTE/.*/(Count|Exists)$`, issue: "#23"},
+	{pattern: `^TestMatrix/sqlserver/(FromCTE|Recursive)/.*/(Count|Exists)$`, issue: "#23"},
+	{pattern: `^TestMatrix/sqlserver/Recursive/.*/(All|First|Include)$`, issue: "#46"},
 }
 
 type knownFailure struct {
@@ -308,7 +309,8 @@ func combination(t *testing.T, db *MatrixDB, w *world, src source, c condition, 
 
 	// SQL Server allows WITH only at the start of a statement, so a write on a
 	// CTE refuses there, as decision 38 says.
-	if src.name == "FromCTE" && !dialect.Supports(db.Dialect(), dialect.SubqueryWith) {
+	if (src.name == "FromCTE" || src.name == "Recursive") &&
+		!dialect.Supports(db.Dialect(), dialect.SubqueryWith) {
 		for _, terminal := range []string{"Update", "Delete"} {
 			check(t, terminal, func(t *testing.T) error {
 				return refused(t, db, func(tx *MatrixDB) error {

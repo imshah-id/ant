@@ -434,6 +434,28 @@ func where(w *world, keep func(a *Author) bool) []*Author {
 	return out
 }
 
+// descendants returns the unmentored authors under 30 and everyone they mentor,
+// all the way down.
+func descendants(w *world) []*Author {
+	var out []*Author
+
+	for _, a := range w.authors {
+		if a.MentorID == nil && a.Age < 30 {
+			out = append(out, a)
+		}
+	}
+
+	for i := 0; i < len(out); i++ {
+		for _, a := range w.authors {
+			if a.MentorID != nil && *a.MentorID == out[i].ID && !slices.Contains(out, a) {
+				out = append(out, a)
+			}
+		}
+	}
+
+	return out
+}
+
 func sources() []source {
 	adult := func(a *Author) bool { return a.Age >= 18 }
 	scored := func(a *Author) bool { return a.Score != nil }
@@ -491,6 +513,15 @@ func sources() []source {
 			rows: func(w *world) []*Author {
 				return where(w, func(a *Author) bool { return a.Country != "lv" })
 			},
+		},
+		{
+			name: "Recursive",
+			build: func(db *MatrixDB) *ant.Query[Author] {
+				return db.Authors.Where(ant.IsNull(&A.MentorID), ant.Lt(&A.Age, 30)).
+					Recursive(&A.Mentees)
+			},
+			rows:     descendants,
+			filtered: true,
 		},
 		{
 			name: "Union of paged sides",

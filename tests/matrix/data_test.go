@@ -28,12 +28,16 @@ type Author struct {
 	Active  bool
 	Country string
 	Marked  bool // set by bulk updates, so a test can see which rows changed
-	Posts   []Post
+	// MentorID makes the authors a forest, for Recursive.
+	MentorID *int64
+	Posts    []Post
+	Mentees  []Author
 }
 
 func (Author) Configure(b *ant.ModelBuilder[Author]) {
 	b.Table("mx_authors")
 	b.HasMany(&A.Posts).ForeignKey(&P.AuthorID).OnDelete(ant.Cascade)
+	b.HasMany(&A.Mentees).ForeignKey(&A.MentorID)
 }
 
 // Post belongs to an Author.
@@ -97,7 +101,8 @@ func create(t *testing.T, target testdb.Target) {
 			score INT NULL,
 			active %[2]s NOT NULL,
 			country %[3]s NOT NULL,
-			marked %[2]s NOT NULL)`,
+			marked %[2]s NOT NULL,
+			mentor_id BIGINT NULL)`,
 			d.id,
 			d.boolean,
 			d.text,
@@ -195,6 +200,18 @@ func seed(t *testing.T, db *MatrixDB) *world {
 	}
 
 	require.NoError(t, db.Authors.InsertOnly(ctx, w.authors...))
+
+	// Some authors have an earlier one as mentor, which makes a forest.
+	for i, a := range w.authors {
+		if i >= 3 && r.IntN(2) == 0 {
+			mentor := w.authors[r.IntN(i)].ID
+			a.MentorID = &mentor
+
+			_, err := db.Authors.Where(ant.Eq(&A.ID, a.ID)).
+				Update(ctx, ant.Set(&A.MentorID, a.MentorID))
+			require.NoError(t, err)
+		}
+	}
 
 	for i, a := range w.authors {
 		for n := range r.IntN(5) {
