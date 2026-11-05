@@ -586,10 +586,14 @@ func (m *Model) Has(f *Field) bool { return slices.Contains(m.Fields, f) }
 
 // Configure runs f once, recording the error it returns.
 func (m *Model) Configure(f func() error) {
-	m.configure.Do(func() { m.err = f() })
+	m.configure.Do(func() {
+		if m.err == nil {
+			m.err = f()
+		}
+	})
 }
 
-// Err returns the error from configuring the model.
+// Err returns the error from building or configuring the model.
 func (m *Model) Err() error { return m.err }
 
 // KeyOf returns the primary key of the model value at entity, false if the
@@ -839,7 +843,7 @@ func build(t reflect.Type) *Model {
 		Table:   &qb.TableRef{Name: TableName(t.Name())},
 		columns: map[string]*Field{},
 	}
-	walk(m, t, 0, "", "")
+	m.err = walk(m, t, 0, "", "")
 
 	for _, f := range m.Fields {
 		m.columns[f.Column] = f
@@ -878,7 +882,7 @@ func build(t reflect.Type) *Model {
 	return m
 }
 
-func walk(m *Model, t reflect.Type, offset uintptr, prefix, columnPrefix string) {
+func walk(m *Model, t reflect.Type, offset uintptr, prefix, columnPrefix string) error {
 	for sf := range t.Fields() {
 		tag := parseTag(sf.Tag.Get("ant"))
 		if !sf.IsExported() || tag.skip {
@@ -891,11 +895,18 @@ func walk(m *Model, t reflect.Type, offset uintptr, prefix, columnPrefix string)
 
 		switch {
 		case sf.Anonymous && sf.Type.Kind() == reflect.Struct && !IsValue(sf.Type):
-			walk(m, sf.Type, off, name+".", columnPrefix)
+			if err := walk(m, sf.Type, off, name+".", columnPrefix); err != nil {
+				return err
+			}
 
 			continue
 		case tag.embedded:
-			walk(m, sf.Type, off, name+".", columnPrefix+tag.prefix)
+			if sf.Type.Kind() != reflect.Struct {
+				return fmt.Errorf("ant: embedded field %s.%s must be a struct value, got %s", m.Type.Name(), name, sf.Type)
+			}
+			if err := walk(m, sf.Type, off, name+".", columnPrefix+tag.prefix); err != nil {
+				return err
+			}
 
 			continue
 		}
@@ -938,6 +949,7 @@ func walk(m *Model, t reflect.Type, offset uintptr, prefix, columnPrefix string)
 			pointer:   pointerTo(sf.Type),
 		})
 	}
+	return nil
 }
 
 var (

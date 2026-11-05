@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -307,5 +308,46 @@ func TestTagKeepsExpressionsWhole(t *testing.T) {
 
 	if score.Storage.Default != "coalesce(1, 2)" || score.Column != "points" {
 		t.Errorf("score = %+v", score)
+	}
+}
+
+func TestEmbeddedFieldMustBeStructValue(t *testing.T) {
+	type address struct{ City string }
+
+	cases := []struct{ name string }{
+		{"Pointer"}, {"Scalar"}, {"Nested.Address"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var model *Model
+
+			switch tc.name {
+			case "Pointer":
+				model = Of[struct {
+					Pointer *address `ant:"embedded,prefix=addr_"`
+				}]()
+			case "Scalar":
+				model = Of[struct {
+					Scalar string `ant:"embedded"`
+				}]()
+			default:
+				model = Of[struct {
+					Nested struct {
+						Address *address `ant:"embedded"`
+					} `ant:"embedded"`
+				}]()
+			}
+			err := model.Err()
+			if err == nil || !strings.Contains(err.Error(), tc.name) {
+				t.Fatalf("got %v, want field %s in error", err, tc.name)
+			}
+			called := false
+			model.Configure(func() error { called = true; return nil })
+
+			if called || model.Err() != err {
+				t.Fatal("configuration replaced invalid embedded-field error")
+			}
+		})
 	}
 }
