@@ -96,6 +96,55 @@ func TestSelfReadsAreWrappedOnMySQL(t *testing.T) {
 				"SELECT `posts`.`user_id` FROM `posts` WHERE (user_id IN (SELECT id FROM USERS))) AS materialized)",
 		},
 		{
+			"raw SQL that quotes the table",
+			update(
+				qb.In{
+					Left: id,
+					Sub: sel(
+						userID,
+						posts,
+						qb.Fragment{SQL: "user_id IN (SELECT id FROM `Users`)"},
+					),
+				},
+			),
+			"UPDATE `users` SET `age` = ? WHERE `users`.`id` IN (" + wrap +
+				"SELECT `posts`.`user_id` FROM `posts` WHERE (user_id IN (SELECT id FROM `Users`))) " +
+				"AS materialized)",
+		},
+		{
+			"raw SQL that names the table outside ASCII",
+			&qb.Update{
+				Table: &qb.TableRef{Name: "Øl"},
+				Set:   set,
+				Where: []qb.Cond{
+					qb.In{
+						Left: id,
+						Sub: sel(
+							userID,
+							posts,
+							qb.Fragment{SQL: "user_id IN (SELECT id FROM øl)"},
+						),
+					},
+				},
+			},
+			"UPDATE `Øl` SET `age` = ? WHERE `users`.`id` IN (" + wrap +
+				"SELECT `posts`.`user_id` FROM `posts` WHERE (user_id IN (SELECT id FROM øl))) " +
+				"AS materialized)",
+		},
+		{
+			"raw SQL that only holds the name in a literal, a comment, or a longer name",
+			update(
+				qb.In{
+					Left: id,
+					Sub: sel(userID, posts, qb.Fragment{
+						SQL: "posts.kind = 'users' /* users */ AND user_id IN (SELECT id FROM users_old)",
+					}),
+				},
+			),
+			"UPDATE `users` SET `age` = ? WHERE `users`.`id` IN (SELECT `posts`.`user_id` FROM `posts` " +
+				"WHERE (posts.kind = 'users' /* users */ AND user_id IN (SELECT id FROM users_old)))",
+		},
+		{
 			"a filter built at render time",
 			update(qb.In{
 				Left: id,
@@ -363,6 +412,29 @@ func TestSelfReadStarOverJoinIsRefused(t *testing.T) {
 				},
 				Order:  []qb.Order{{Value: id}},
 				Offset: new(1),
+			},
+		}},
+	})
+	if !errors.Is(err, ant.ErrUnsupported) {
+		t.Fatalf("got %v, want ErrUnsupported", err)
+	}
+}
+
+// A star beside another column may name a column twice too, so that write is
+// refused as well.
+func TestSelfReadStarBesideColumnsIsRefused(t *testing.T) {
+	users := &qb.TableRef{Name: "users"}
+	id := qb.Column{Table: users, Name: "id"}
+
+	_, _, err := mysql.Dialect.Render(&qb.Delete{
+		Table: users,
+		Where: []qb.Cond{qb.Exists{
+			Select: &qb.Select{
+				Columns: []qb.Selected{
+					{Value: qb.Star{}},
+					{Value: id},
+				},
+				From: qb.Source{Table: users},
 			},
 		}},
 	})

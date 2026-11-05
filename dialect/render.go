@@ -298,8 +298,7 @@ func (r *renderer) fragment(f qb.Fragment) {
 	}
 
 	// Raw SQL cannot be read, so naming the table counts as reading it.
-	if r.writing != nil &&
-		strings.Contains(strings.ToLower(f.SQL), strings.ToLower(r.writing.Name)) {
+	if r.writing != nil && namesTable(f.SQL, r.writing.Name) {
 		r.read = true
 	}
 
@@ -326,6 +325,62 @@ func (r *renderer) fragment(f qb.Fragment) {
 	if len(args) > 0 && r.err == nil {
 		r.err = fmt.Errorf("ant: SQL fragment %q has %d unused arguments", f.SQL, len(args))
 	}
+}
+
+// namesTable reports whether raw SQL names table, in any case: as a whole word,
+// or quoted in backticks or double quotes, which ANSI_QUOTES makes a name. A
+// string literal or a comment that holds it does not count.
+func namesTable(q, table string) bool {
+	word := func(c byte) bool {
+		return isNameByte(c, false) || c == '$' || c >= 0x80
+	}
+
+	for i := 0; i < len(q); {
+		c := q[i]
+
+		switch {
+		case c == '`' || c == '"':
+			var name strings.Builder
+
+			j := i + 1
+
+			for ; j < len(q); j++ {
+				if q[j] == c {
+					if j+1 == len(q) || q[j+1] != c {
+						break
+					}
+
+					j++
+				}
+
+				name.WriteByte(q[j])
+			}
+
+			if strings.EqualFold(name.String(), table) {
+				return true
+			}
+
+			i = j + 1
+		case skipQuoted(q, i) > i:
+			i = skipQuoted(q, i)
+		case word(c):
+			j := i + 1
+
+			for j < len(q) && word(q[j]) {
+				j++
+			}
+
+			if strings.EqualFold(q[i:j], table) {
+				return true
+			}
+
+			i = j
+		default:
+			i++
+		}
+	}
+
+	return false
 }
 
 func (r *renderer) selected(s qb.Selected) {
@@ -860,7 +915,7 @@ func (r *renderer) subquery(s *qb.Select, exists bool) {
 	derived := derivable(s, exists)
 	if derived == nil && r.err == nil {
 		r.err = fmt.Errorf(
-			"%w: a SELECT * over a join or a set that reads the table being written, on %s",
+			"%w: a SELECT * beside other columns, or over a join or a set, that reads the table being written, on %s",
 			errs.ErrUnsupported,
 			r.d.Name(),
 		)
@@ -883,8 +938,8 @@ func (r *renderer) subquery(s *qb.Select, exists bool) {
 // query may refer to. The columns of EXISTS matter only to what reads them, so
 // SELECT * there, which could name a column twice, becomes SELECT 1 unless
 // grouping, ordering, an offset, or a set reads the columns. A star that stays,
-// over a join or a set, may hold two columns of one name, which a derived
-// table refuses, so that is nil.
+// beside other columns or over a join or a set, may hold two columns of one
+// name, which a derived table refuses, so that is nil.
 func derivable(s *qb.Select, exists bool) *qb.Select {
 	out := *s
 
@@ -905,7 +960,7 @@ func derivable(s *qb.Select, exists bool) *qb.Select {
 			out.Columns = []qb.Selected{{Value: qb.Fragment{SQL: "1"}}}
 
 			return &out
-		case len(s.Joins) > 0 || len(s.Sets) > 0:
+		case len(s.Columns) > 1 || len(s.Joins) > 0 || len(s.Sets) > 0:
 			return nil
 		}
 
