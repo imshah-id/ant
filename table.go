@@ -293,7 +293,7 @@ func (t *Table[T]) Reload(ctx context.Context, e *T) error {
 	if entry != nil {
 		// In a transaction, a rollback takes the read back with the rows it
 		// read: the values, and the state and snapshot.
-		undo := entry.Reloaded(unsafe.Pointer(&before))
+		undo := t.state.tracker.Reloaded(entry, unsafe.Pointer(&before))
 
 		if t.state.tx != nil {
 			t.state.onRollback(undo)

@@ -442,8 +442,19 @@ func (t *Tracker) put(m *meta.Model, entity unsafe.Pointer, state State) *Entry 
 // that was new before it is forgotten, since its row goes with the rollback, and
 // any other stays Deleted, as its row comes back.
 func (t *Tracker) Saved(e *Entry, state State) (undo func()) {
-	restore := e.Saved(state)
+	return t.keepRemoval(e, e.Saved(state))
+}
 
+// Reloaded is Entry.Reloaded, keeping a removal asked for after the reload as
+// Saved does.
+func (t *Tracker) Reloaded(e *Entry, before unsafe.Pointer) (undo func()) {
+	return t.keepRemoval(e, e.Reloaded(before))
+}
+
+// keepRemoval wraps an undo so that a removal asked for after the change it
+// undoes survives it: an entry that was new before is forgotten, since its row
+// goes with the rollback, and any other stays Deleted.
+func (t *Tracker) keepRemoval(e *Entry, restore func()) func() {
 	return func() {
 		removed := e.State == Deleted
 
