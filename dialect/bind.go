@@ -106,7 +106,17 @@ func utc(v any) any {
 		// time found at the end goes on in place of the chain.
 		rv := reflect.ValueOf(v)
 		if rv.Kind() == reflect.Pointer && !rv.IsNil() {
-			switch out := utc(rv.Elem().Interface()); out.(type) {
+			elem := rv.Elem().Interface()
+			out := utc(elem)
+
+			// A Valuer down the chain was asked already, so what it gave goes on,
+			// NULL and errors included, rather than having it asked again.
+			if valuer, ok := elem.(driver.Valuer); ok && valuer != nil &&
+				holdsTime(reflect.TypeOf(elem), nil) {
+				return out
+			}
+
+			switch out.(type) {
 			case time.Time, qb.Secret, *qb.Secret:
 				return out
 			}

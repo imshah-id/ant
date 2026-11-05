@@ -229,3 +229,27 @@ func TestOddValuers(t *testing.T) {
 }
 
 func ptrTo[V any](v V) *V { return &v }
+
+// A Valuer built on a time, behind a pointer to a pointer, is asked once, and
+// what it gives, an error too, goes on.
+func TestPointedValuersAreAskedOnce(t *testing.T) {
+	calls := 0
+	inner := &overridden{calls: &calls}
+
+	for _, d := range []dialect.Dialect{sqlite.Dialect, sqlserver.Dialect} {
+		_, args, err := d.Render(
+			&qb.Select{Columns: []qb.Selected{{Value: qb.Param{Value: &inner}}}},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if args[0] != "text" {
+			t.Errorf("%s: bound %#v", d.Name(), args[0])
+		}
+	}
+
+	if calls != 2 {
+		t.Errorf("Value ran %d times for two renders", calls)
+	}
+}
