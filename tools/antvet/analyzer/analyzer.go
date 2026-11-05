@@ -258,11 +258,15 @@ func configuredKey(pass *analysis.Pass, fn *ast.FuncDecl) (string, bool) {
 
 	ast.Inspect(fn.Body, func(n ast.Node) bool {
 		switch n := n.(type) {
-		case *ast.SelectorExpr:
-			if id, ok := ast.Unparen(n.X).(*ast.Ident); ok {
-				allowed[id] = true
-			}
 		case *ast.CallExpr:
+			// A method called on the builder there and then; a method value, as
+			// setKey := b.Key, could be called anywhere.
+			if selector, ok := ast.Unparen(indexed(n.Fun)).(*ast.SelectorExpr); ok {
+				if id, ok := ast.Unparen(selector.X).(*ast.Ident); ok {
+					allowed[id] = true
+				}
+			}
+
 			if isAntFunc(pass, n) {
 				for _, a := range n.Args {
 					if id, ok := ast.Unparen(a).(*ast.Ident); ok {
@@ -363,12 +367,18 @@ func receiverType(pass *analysis.Pass, fn *ast.FuncDecl) *types.Named {
 // setsKey reports whether call sets a primary key, and of which field, if Find
 // can take it.
 func setsKey(pass *analysis.Pass, call *ast.CallExpr) (string, bool) {
-	selector, ok := ast.Unparen(indexed(call.Fun)).(*ast.SelectorExpr)
-	if !ok {
+	var id *ast.Ident
+
+	switch fun := ast.Unparen(indexed(call.Fun)).(type) {
+	case *ast.SelectorExpr:
+		id = fun.Sel
+	case *ast.Ident: // a dot import
+		id = fun
+	default:
 		return "", false
 	}
 
-	object, ok := pass.TypesInfo.Uses[selector.Sel].(*types.Func)
+	object, ok := pass.TypesInfo.Uses[id].(*types.Func)
 	if !ok || object.Pkg() == nil || object.Pkg().Path() != antPath {
 		return "", false
 	}
@@ -463,7 +473,40 @@ func modelOf(t types.Type) string {
 		return ""
 	}
 
-	return types.TypeString(types.Unalias(pointer.Elem()), nil)
+	return types.TypeString(unalias(pointer.Elem()), nil)
+}
+
+// unalias resolves aliases all the way into a type, its type arguments
+// included, so that Row[Key] with type Key = int64 names the same model as
+// Row[int64].
+func unalias(t types.Type) types.Type {
+	switch t := types.Unalias(t).(type) {
+	case *types.Pointer:
+		return types.NewPointer(unalias(t.Elem()))
+	case *types.Slice:
+		return types.NewSlice(unalias(t.Elem()))
+	case *types.Map:
+		return types.NewMap(unalias(t.Key()), unalias(t.Elem()))
+	case *types.Named:
+		args := t.TypeArgs()
+		if args.Len() == 0 {
+			return t
+		}
+
+		list := make([]types.Type, args.Len())
+
+		for i := range args.Len() {
+			list[i] = unalias(args.At(i))
+		}
+
+		if out, err := types.Instantiate(nil, t.Origin(), list, false); err == nil {
+			return out
+		}
+
+		return t
+	default:
+		return t
+	}
 }
 
 func objectOf(pass *analysis.Pass, e ast.Expr) types.Object {
@@ -491,12 +534,18 @@ func calleeName(pass *analysis.Pass, call *ast.CallExpr) string {
 		fun = index.X
 	}
 
-	selector, ok := fun.(*ast.SelectorExpr)
-	if !ok {
+	var id *ast.Ident
+
+	switch fun := ast.Unparen(fun).(type) {
+	case *ast.SelectorExpr:
+		id = fun.Sel
+	case *ast.Ident: // a dot import
+		id = fun
+	default:
 		return ""
 	}
 
-	object, ok := pass.TypesInfo.Uses[selector.Sel].(*types.Func)
+	object, ok := pass.TypesInfo.Uses[id].(*types.Func)
 	if !ok || object.Pkg() == nil || object.Pkg().Path() != antPath {
 		return ""
 	}
@@ -619,7 +668,7 @@ func queryArg(t types.Type) types.Type {
 		return nil
 	}
 
-	return types.Unalias(named.TypeArgs().At(0))
+	return unalias(named.TypeArgs().At(0))
 }
 
 // singleModel lists conditions that name one column of the query's own model.
@@ -692,7 +741,14 @@ func (c *checker) checkWhere(call *ast.CallExpr, stack []ast.Node) {
 func (c *checker) runs(stack []ast.Node) bool {
 	node := stack[len(stack)-1]
 
-	for i := len(stack) - 2; i >= 1; i -= 2 {
+	for i := len(stack) - 2; i >= 1; i-- {
+		// Parentheses around a receiver change nothing.
+		if paren, ok := stack[i].(*ast.ParenExpr); ok && paren.X == node {
+			node = paren
+
+			continue
+		}
+
 		selector, ok := stack[i].(*ast.SelectorExpr)
 		if !ok || selector.X != node {
 			return false
@@ -708,6 +764,7 @@ func (c *checker) runs(stack []ast.Node) bool {
 		}
 
 		node = next
+		i--
 	}
 
 	return false
@@ -751,7 +808,13 @@ func (c *checker) outerModels(stack []ast.Node) ([]string, bool) {
 			continue
 		}
 
-		if isAntFunc(c.pass, call) && calleeName(c.pass, call) != "" {
+		if name := calleeName(c.pass, call); isAntFunc(c.pass, call) && name != "" {
+			// Has and the Related functions open a scope of the related model,
+			// which the analyzer does not follow.
+			if strings.HasPrefix(name, "Has") || strings.HasSuffix(name, "Related") {
+				return nil, false
+			}
+
 			continue // ant.Exists, ant.SubOf, and the like pass a query on
 		}
 

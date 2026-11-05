@@ -9,9 +9,10 @@ import (
 )
 
 type User struct {
-	ID   int64
-	Age  int
-	Name string
+	ID    int64
+	Age   int
+	Name  string
+	Posts []Post
 }
 
 type Post struct {
@@ -117,6 +118,30 @@ func (Aliased) Configure(b *ant.ModelBuilder[Aliased]) {
 
 func keyOnAliased(b *ant.ModelBuilder[Aliased]) { b.Key(&Al.Code) }
 
+// Captured takes its key setter as a method value, which could run anywhere.
+type Captured struct { // want Captured:"key "
+	ID   int64
+	Code string
+}
+
+func (Captured) Configure(b *ant.ModelBuilder[Captured]) {
+	setKey := b.Key[string]
+	setKey(&Ca.Code)
+}
+
+// Row is generic, and Key an alias, so Row[Key] is Row[int64].
+type Row[K any] struct {
+	ID   K
+	Name string
+}
+
+type Key = int64
+
+var (
+	Ca = ant.Fields[Captured]() // want Ca:"probe of example.Captured"
+	Ro = ant.Fields[Row[Key]]() // want Ro:"probe of example.Row\\[int64\\]"
+)
+
 var (
 	Fl = ant.Fields[Fluent]()  // want Fl:"probe of example.Fluent"
 	Ea = ant.Fields[Early]()   // want Ea:"probe of example.Early"
@@ -187,6 +212,23 @@ func good(
 
 // A key the analyzer cannot be sure of is not checked, and a nested one is
 // followed to its own field.
+func more(
+	ctx context.Context,
+	users *ant.Table[User],
+	posts *ant.Table[Post],
+	countries *ant.Table[models.Country],
+	captured *ant.Table[Captured],
+	rows *ant.Table[Row[int64]],
+) {
+	captured.Find(ctx, "LV")
+	rows.Where(ant.Eq(&Ro.Name, "x")).All(ctx)
+
+	// Has opens a scope of the related model, which is not followed.
+	users.Where(ant.Has(&U.Posts, ant.Exists(countries.Where(ant.Eq(&P.ID, "x"))))).All(ctx)
+
+	(posts.Where(ant.Gt(&U.Age, 18))).All(ctx) // want `condition on User in a query of Post`
+}
+
 func keys(
 	ctx context.Context,
 	branchy *ant.Table[Branchy],

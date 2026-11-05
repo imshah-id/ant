@@ -5,11 +5,12 @@ import "context"
 
 type Cond struct{}
 
-func Fields[T any]() *T                   { return new(T) }
-func Eq[V comparable](field *V, v V) Cond { return Cond{} }
-func Gt[V any](field *V, v V) Cond        { return Cond{} }
-func EqCol[V comparable](a, b *V) Cond    { return Cond{} }
-func Exists(q any) Cond                   { return Cond{} }
+func Fields[T any]() *T                       { return new(T) }
+func Eq[V comparable](field *V, v V) Cond     { return Cond{} }
+func Gt[V any](field *V, v V) Cond            { return Cond{} }
+func EqCol[V comparable](a, b *V) Cond        { return Cond{} }
+func Exists(q any) Cond                       { return Cond{} }
+func Has[R any](rel *[]R, conds ...Cond) Cond { return Cond{} }
 
 type Query[T any] struct{}
 
