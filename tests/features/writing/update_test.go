@@ -59,6 +59,7 @@ func TestUpdate(t *testing.T) {
 		})
 
 		t.Run("a field of another model", func(t *testing.T) {
+			//antvet:ignore another model's field, on purpose: the test checks the error
 			_, err := db.Users.Where(ant.Eq(&U.ID, alice.ID)).Update(ctx, ant.Set(&P.Title, "x"))
 			require.ErrorIs(t, err, ant.ErrWrongModel)
 		})

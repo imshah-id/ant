@@ -101,6 +101,7 @@ func TestMultiJoin(t *testing.T) {
 		})
 
 		t.Run("a relation of a model outside the query", func(t *testing.T) {
+			//antvet:ignore another model's field, on purpose: the test checks the error
 			_, err := db.Comments.Join(&En.Writer).
 				Select(func(c *Comment, w *Writer) string { return "" }).All(ctx)
 			require.ErrorIs(t, err, ant.ErrWrongModel)

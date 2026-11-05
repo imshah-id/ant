@@ -60,6 +60,7 @@ func TestOrderBy(t *testing.T) {
 		})
 
 		t.Run("a probe of another model is an error", func(t *testing.T) {
+			//antvet:ignore another model's field, on purpose: the test checks the error
 			_, err := db.Users.OrderBy(&P.Title).All(ctx)
 			require.ErrorIs(t, err, ant.ErrWrongModel)
 		})

@@ -56,32 +56,141 @@ func (*probeFact) AFact() {}
 
 func (f *probeFact) String() string { return "probe of " + f.Model }
 
-// fieldTaking lists the functions whose first argument is a field pointer.
-var fieldTaking = map[string]bool{
-	"Eq":        true,
-	"Ne":        true,
-	"Gt":        true,
-	"Gte":       true,
-	"Lt":        true,
-	"Lte":       true,
-	"In":        true,
-	"NotIn":     true,
-	"Between":   true,
-	"Like":      true,
-	"ILike":     true,
-	"IsNull":    true,
-	"IsNotNull": true,
-	"Past":      true,
-	"Future":    true,
-	"Today":     true,
-	"InSub":     true,
-	"NotInSub":  true,
-	"Set":       true,
-	"SetExpr":   true,
-	"Inc":       true,
-	"Dec":       true,
-	"Col":       true,
-	"F":         true,
+// fields says which arguments of a call are field pointers: count of them from
+// the one at, or all from there on if count is 0.
+type fields struct {
+	at, count int
+}
+
+func (f fields) of(args []ast.Expr) []ast.Expr {
+	if f.at >= len(args) {
+		return nil
+	}
+
+	if f.count == 0 {
+		return args[f.at:]
+	}
+
+	return args[f.at:min(f.at+f.count, len(args))]
+}
+
+var first = fields{0, 1}
+
+// fieldFuncs lists ant's functions that take field pointers, and where.
+var fieldFuncs = map[string]fields{
+	"Eq":           first,
+	"Ne":           first,
+	"Gt":           first,
+	"Gte":          first,
+	"Lt":           first,
+	"Lte":          first,
+	"In":           first,
+	"NotIn":        first,
+	"Between":      first,
+	"Like":         first,
+	"ILike":        first,
+	"IsNull":       first,
+	"IsNotNull":    first,
+	"Past":         first,
+	"Future":       first,
+	"Today":        first,
+	"InSub":        first,
+	"NotInSub":     first,
+	"AnyOf":        {1, 0},
+	"AllOf":        {1, 0},
+	"NoneOf":       {1, 0},
+	"EqCol":        {0, 2},
+	"Set":          first,
+	"SetExpr":      first,
+	"Inc":          first,
+	"Dec":          first,
+	"Col":          first,
+	"F":            first,
+	"Into":         {0, 2},
+	"IntoExpr":     first,
+	"SubOf":        {1, 1},
+	"SumOf":        {2, 1},
+	"AvgOf":        {2, 1},
+	"MinOf":        {2, 1},
+	"MaxOf":        {2, 1},
+	"Pluck":        {2, 1},
+	"Sum":          first,
+	"Avg":          first,
+	"Min":          first,
+	"Max":          first,
+	"CountOf":      first,
+	"Lower":        first,
+	"Upper":        first,
+	"Length":       first,
+	"Collate":      first,
+	"PartitionBy":  first,
+	"OnConflict":   first,
+	"Then":         {1, 1},
+	"Has":          first,
+	"HasNone":      first,
+	"HasOne":       first,
+	"CountRelated": first,
+	"SumRelated":   {0, 2},
+	"AvgRelated":   {0, 2},
+	"MinRelated":   {0, 2},
+	"MaxRelated":   {0, 2},
+	"Related":      {2, 1},
+	"RelatedOne":   {2, 1},
+	"Link":         {3, 1},
+	"Unlink":       {3, 1},
+	"SyncLinks":    {3, 1},
+	"Toggle":       {3, 1},
+	"IsDirty":      {1, 1},
+	"Original":     {1, 1},
+}
+
+// fieldMethods lists the methods of ant's query builders whose first argument
+// is a field pointer, and how a field of another model is judged there: by the
+// query's scope, as conditions are, since a subquery may order or group by its
+// outer query's columns, or by the query's own models alone, for what it reads
+// into its entities or the relations it loads.
+var fieldMethods = map[string]judging{
+	"OrderBy":       byScope,
+	"OrderByDesc":   byScope,
+	"ThenBy":        byScope,
+	"ThenByDesc":    byScope,
+	"GroupBy":       byScope,
+	"Column":        byOwn,
+	"Omit":          byOwn,
+	"With":          byOwn,
+	"Include":       byOwn,
+	"IncludeOne":    byOwn,
+	"IncludeJoined": byOwn,
+	"Join":          byOwn,
+	"JoinMany":      byOwn,
+	"LeftJoin":      byOwn,
+	"LeftJoinMany":  byOwn,
+	"JoinUsing":     probeOnly,
+}
+
+type judging int
+
+const (
+	byScope judging = iota + 1
+	byOwn
+	probeOnly // JoinUsing reads only the column's name, which both sides have
+)
+
+// updates lists the methods that write their assignments to the query's rows.
+var updates = map[string]bool{
+	"Update":          true,
+	"UpdateReturning": true,
+	"UpdateSQL":       true,
+}
+
+// aggregates lists the functions that run a query, ctx and the query first,
+// and read a field of its model.
+var aggregates = map[string]bool{
+	"SumOf": true,
+	"AvgOf": true,
+	"MinOf": true,
+	"MaxOf": true,
+	"Pluck": true,
 }
 
 func run(pass *analysis.Pass) (any, error) {
@@ -100,8 +209,8 @@ func run(pass *analysis.Pass) (any, error) {
 			}
 
 			call := n.(*ast.CallExpr)
-			c.checkCondition(call)
-			c.checkWhere(call, stack)
+			c.checkProbes(call)
+			c.checkScope(call, stack)
 			checkFind(pass, call)
 
 			return true
@@ -123,27 +232,42 @@ type checker struct {
 // variable that holds one, wherever in the package that comes. A declaration
 // with no value does not count, so a package variable may be set in init. A
 // variable that is ever given anything else may hold that at any use, as the
-// analyzer does not follow the order code runs in, so it is an ordinary one.
+// analyzer does not follow the order code runs in, so it is an ordinary one. So
+// is one whose value the analyzer cannot see: a parameter or a receiver, which
+// the caller gives, a range variable, or one whose address is taken, through
+// which anything may be stored.
 func findProbes(pass *analysis.Pass, in *inspector.Inspector) map[types.Object]string {
 	assigned := map[types.Object][]ast.Expr{}
 
-	// value is nil where one call gives several names theirs.
-	add := func(id *ast.Ident, values []ast.Expr, names, i int) {
-		object, ok := pass.TypesInfo.ObjectOf(id).(*types.Var)
-		if !ok {
+	// A nil value is one the analyzer cannot see.
+	add := func(id *ast.Ident, value ast.Expr) {
+		if object, ok := pass.TypesInfo.ObjectOf(id).(*types.Var); ok {
+			assigned[object] = append(assigned[object], value)
+		}
+	}
+
+	unseen := func(list *ast.FieldList) {
+		if list == nil {
 			return
 		}
 
-		var value ast.Expr
-
-		if len(values) == names {
-			value = values[i]
+		for _, field := range list.List {
+			for _, name := range field.Names {
+				add(name, nil)
+			}
 		}
-
-		assigned[object] = append(assigned[object], value)
 	}
 
-	in.Preorder([]ast.Node{(*ast.AssignStmt)(nil), (*ast.ValueSpec)(nil)}, func(n ast.Node) {
+	kinds := []ast.Node{
+		(*ast.AssignStmt)(nil),
+		(*ast.ValueSpec)(nil),
+		(*ast.FuncDecl)(nil),
+		(*ast.FuncType)(nil),
+		(*ast.RangeStmt)(nil),
+		(*ast.UnaryExpr)(nil),
+	}
+
+	in.Preorder(kinds, func(n ast.Node) {
 		switch n := n.(type) {
 		case *ast.AssignStmt:
 			if n.Tok != token.ASSIGN && n.Tok != token.DEFINE {
@@ -152,7 +276,7 @@ func findProbes(pass *analysis.Pass, in *inspector.Inspector) map[types.Object]s
 
 			for i, left := range n.Lhs {
 				if id, ok := ast.Unparen(left).(*ast.Ident); ok {
-					add(id, n.Rhs, len(n.Lhs), i)
+					add(id, valueAt(n.Rhs, len(n.Lhs), i))
 				}
 			}
 		case *ast.ValueSpec:
@@ -161,7 +285,21 @@ func findProbes(pass *analysis.Pass, in *inspector.Inspector) map[types.Object]s
 			}
 
 			for i, name := range n.Names {
-				add(name, n.Values, len(n.Names), i)
+				add(name, valueAt(n.Values, len(n.Names), i))
+			}
+		case *ast.FuncDecl:
+			unseen(n.Recv)
+		case *ast.FuncType:
+			unseen(n.Params)
+		case *ast.RangeStmt:
+			for _, e := range []ast.Expr{n.Key, n.Value} {
+				if id, ok := ast.Unparen(e).(*ast.Ident); ok {
+					add(id, nil)
+				}
+			}
+		case *ast.UnaryExpr:
+			if id, ok := ast.Unparen(n.X).(*ast.Ident); ok && n.Op == token.AND {
+				add(id, nil)
 			}
 		}
 	})
@@ -230,6 +368,16 @@ func findProbes(pass *analysis.Pass, in *inspector.Inspector) map[types.Object]s
 	}
 
 	return locals
+}
+
+// valueAt returns the value of the i-th of names assigned from values, or nil
+// where one call gives them all.
+func valueAt(values []ast.Expr, names, i int) ast.Expr {
+	if len(values) != names {
+		return nil
+	}
+
+	return values[i]
 }
 
 // quieted returns pass with its reports dropped on lines that //antvet:ignore
@@ -571,17 +719,42 @@ func modelOf(t types.Type) string {
 	return types.TypeString(unalias(pointer.Elem()), nil)
 }
 
-// unalias resolves aliases all the way into a type, its type arguments
-// included, so that Row[Key] with type Key = int64 names the same model as
-// Row[int64].
+// unalias resolves aliases all the way into a type, its type arguments and the
+// types it is made of included, so that Row[[4]Key] with type Key = int64 is
+// written as Row[[4]int64]. Models are compared with types.Identical, which sees
+// through aliases itself, so this is for the names that facts and reports give.
 func unalias(t types.Type) types.Type {
 	switch t := types.Unalias(t).(type) {
 	case *types.Pointer:
 		return types.NewPointer(unalias(t.Elem()))
 	case *types.Slice:
 		return types.NewSlice(unalias(t.Elem()))
+	case *types.Array:
+		return types.NewArray(unalias(t.Elem()), t.Len())
+	case *types.Chan:
+		return types.NewChan(t.Dir(), unalias(t.Elem()))
 	case *types.Map:
 		return types.NewMap(unalias(t.Key()), unalias(t.Elem()))
+	case *types.Signature:
+		return types.NewSignatureType(
+			nil,
+			nil,
+			nil,
+			unaliasTuple(t.Params()),
+			unaliasTuple(t.Results()),
+			t.Variadic(),
+		)
+	case *types.Struct:
+		fields := make([]*types.Var, t.NumFields())
+		tags := make([]string, t.NumFields())
+
+		for i := range t.NumFields() {
+			f := t.Field(i)
+			fields[i] = types.NewField(f.Pos(), f.Pkg(), f.Name(), unalias(f.Type()), f.Embedded())
+			tags[i] = t.Tag(i)
+		}
+
+		return types.NewStruct(fields, tags)
 	case *types.Named:
 		args := t.TypeArgs()
 		if args.Len() == 0 {
@@ -602,6 +775,33 @@ func unalias(t types.Type) types.Type {
 	default:
 		return t
 	}
+}
+
+func unaliasTuple(tuple *types.Tuple) *types.Tuple {
+	vars := make([]*types.Var, tuple.Len())
+
+	for i := range tuple.Len() {
+		v := tuple.At(i)
+		vars[i] = types.NewParam(v.Pos(), v.Pkg(), v.Name(), unalias(v.Type()))
+	}
+
+	return types.NewTuple(vars...)
+}
+
+// name writes a model as reports show it: aliases resolved, packages left out.
+func name(t types.Type) string {
+	return types.TypeString(unalias(t), func(*types.Package) string { return "" })
+}
+
+// names writes the models of a query, such as Post and User for a join.
+func names(models []types.Type) string {
+	out := make([]string, len(models))
+
+	for i, model := range models {
+		out[i] = name(model)
+	}
+
+	return strings.Join(out, " and ")
 }
 
 func objectOf(pass *analysis.Pass, e ast.Expr) types.Object {
@@ -652,13 +852,16 @@ func calleeName(pass *analysis.Pass, call *ast.CallExpr) string {
 	return object.Name()
 }
 
-// probeOf follows a pointer like &U.Age to its root, and returns the root's
-// variable and whether that is a probe.
-func (c *checker) probeOf(arg ast.Expr) (root ast.Expr, model string, isField bool) {
+// probeOf follows a pointer like &U.Age to the variable it is a field of, and
+// returns that, the model of the probe it holds, or "" if it holds none, and
+// whether the analyzer can tell. It cannot for a field behind a pointer that is
+// itself held in a field, as in &holder.U.Age, or behind what a call returns, as
+// in &probe[User]().Age: either may be a probe.
+func (c *checker) probeOf(arg ast.Expr) (root ast.Expr, model string, known bool) {
 	pass := c.pass
 
 	unary, ok := ast.Unparen(arg).(*ast.UnaryExpr)
-	if !ok || unary.Op.String() != "&" {
+	if !ok || unary.Op != token.AND {
 		return nil, "", false
 	}
 
@@ -676,6 +879,15 @@ func (c *checker) probeOf(arg ast.Expr) (root ast.Expr, model string, isField bo
 		}
 
 		e = ast.Unparen(selector.X)
+
+		if inner, ok := e.(*ast.SelectorExpr); ok && pass.TypesInfo.Selections[inner] != nil &&
+			pointee(pass.TypesInfo.TypeOf(inner)) != nil {
+			return nil, "", false
+		}
+	}
+
+	if _, ok := e.(*ast.CallExpr); ok {
+		return nil, "", false
 	}
 
 	object := objectOf(pass, e)
@@ -695,55 +907,63 @@ func (c *checker) probeOf(arg ast.Expr) (root ast.Expr, model string, isField bo
 	return e, "", true
 }
 
+// pointee returns what a pointer of type t points to, or nil if t is no pointer.
+func pointee(t types.Type) types.Type {
+	if t == nil {
+		return nil
+	}
+
+	if pointer, ok := t.Underlying().(*types.Pointer); ok {
+		return pointer.Elem()
+	}
+
+	return nil
+}
+
 func identOf(e ast.Expr) *ast.Ident {
 	id, _ := e.(*ast.Ident)
 
 	return id
 }
 
-// checkCondition reports a field pointer that is not from a probe.
-func (c *checker) checkCondition(call *ast.CallExpr) {
-	pass := c.pass
+// checkProbes reports field pointers that are not from a probe, among the
+// arguments of ant's functions and its builders' methods that take them.
+func (c *checker) checkProbes(call *ast.CallExpr) {
+	label, args := c.fieldArgs(call)
 
-	name := calleeName(pass, call)
-	if !fieldTaking[name] || len(call.Args) == 0 {
-		return
-	}
-	// A pointer that is not written &x.y here came from elsewhere, and may be fine.
-	root, model, isField := c.probeOf(call.Args[0])
-	if !isField && root == nil {
-		if unary, ok := ast.Unparen(call.Args[0]).(*ast.UnaryExpr); ok && unary.Op.String() == "&" {
-			pass.Reportf(
-				call.Args[0].Pos(),
-				"ant.%s needs a field of a probe from ant.Fields",
-				name,
+	for _, arg := range args {
+		if _, model, known := c.probeOf(arg); known && model == "" {
+			c.pass.Reportf(
+				arg.Pos(),
+				"%s needs a field of a probe from ant.Fields, not of an ordinary variable",
+				label,
 			)
 		}
-
-		return
-	}
-
-	if model == "" {
-		pass.Reportf(
-			call.Args[0].Pos(),
-			"ant.%s needs a field of a probe from ant.Fields, not of an ordinary variable",
-			name,
-		)
 	}
 }
 
-// queryModel returns T of a *Query[T] or *Table[T] receiver, or "".
-func queryModel(t types.Type) string {
-	if model := queryArg(t); model != nil {
-		return types.TypeString(model, nil)
+// fieldArgs returns how reports name call, and those of its arguments that are
+// field pointers.
+func (c *checker) fieldArgs(call *ast.CallExpr) (string, []ast.Expr) {
+	if name := calleeName(c.pass, call); name != "" {
+		if f, ok := fieldFuncs[name]; ok {
+			return "ant." + name, f.of(call.Args)
+		}
+
+		return "", nil
 	}
 
-	return ""
+	selector, ok := ast.Unparen(indexed(call.Fun)).(*ast.SelectorExpr)
+	if !ok || fieldMethods[selector.Sel.Name] == 0 || !isAntFunc(c.pass, call) ||
+		!builder(c.pass.TypesInfo.TypeOf(selector.X)) {
+		return "", nil
+	}
+
+	return selector.Sel.Name, first.of(call.Args)
 }
 
-// queryArg returns T of a *Query[T] or *Table[T], unaliased, or nil, as it is
-// when T holds a type parameter, which only an instantiation fills in.
-func queryArg(t types.Type) types.Type {
+// antType returns the named type of ant that t is, or points to, or nil.
+func antType(t types.Type) *types.Named {
 	if t == nil {
 		return nil
 	}
@@ -758,20 +978,52 @@ func queryArg(t types.Type) types.Type {
 		return nil
 	}
 
-	if name := named.Obj().
-		Name(); (name != "Query" && name != "Table") ||
-		named.TypeArgs().Len() != 1 {
+	return named
+}
+
+// queryModels returns the models a query reads: T of a *Query[T] or *Table[T],
+// and each model of a join. It returns nil for anything else, and when a model
+// holds a type parameter, which only an instantiation fills in.
+func queryModels(t types.Type) []types.Type {
+	named := antType(t)
+	if named == nil {
 		return nil
 	}
 
-	if model := unalias(named.TypeArgs().At(0)); !generic(model) {
-		return model
+	switch named.Obj().Name() {
+	case "Query", "Table", "Join2", "Join3":
+	default:
+		return nil
+	}
+
+	var out []types.Type
+
+	for arg := range named.TypeArgs().Types() {
+		if generic(arg) {
+			return nil
+		}
+
+		out = append(out, arg)
+	}
+
+	return out
+}
+
+// queryArg returns T of a *Query[T] or *Table[T], or nil.
+func queryArg(t types.Type) types.Type {
+	named := antType(t)
+	if named == nil || named.Obj().Name() != "Query" && named.Obj().Name() != "Table" {
+		return nil
+	}
+
+	if models := queryModels(t); len(models) == 1 {
+		return models[0]
 	}
 
 	return nil
 }
 
-// generic reports whether t holds a type parameter.
+// generic reports whether t holds a type parameter anywhere.
 func generic(t types.Type) bool {
 	switch t := types.Unalias(t).(type) {
 	case *types.TypeParam:
@@ -779,6 +1031,22 @@ func generic(t types.Type) bool {
 	case *types.Named:
 		for arg := range t.TypeArgs().Types() {
 			if generic(arg) {
+				return true
+			}
+		}
+	case *types.Map:
+		return generic(t.Key()) || generic(t.Elem())
+	case *types.Signature:
+		return generic(t.Params()) || generic(t.Results())
+	case *types.Tuple:
+		for v := range t.Variables() {
+			if generic(v.Type()) {
+				return true
+			}
+		}
+	case *types.Struct:
+		for f := range t.Fields() {
+			if generic(f.Type()) {
 				return true
 			}
 		}
@@ -810,51 +1078,121 @@ var singleModel = map[string]bool{
 	"Today":     true,
 	"InSub":     true,
 	"NotInSub":  true,
+	"AnyOf":     true,
+	"AllOf":     true,
+	"NoneOf":    true,
 }
 
-// checkWhere reports a condition on a model other than the query's. A subquery's
-// conditions may name its outer query's models, so a query is judged only where
-// it is plainly not one: when its chain ends in a call that runs it, such as All,
-// or when it sits inside an outer query, whose models it may also name.
-func (c *checker) checkWhere(call *ast.CallExpr, stack []ast.Node) {
+// checkScope reports fields of models a query does not read: in its conditions,
+// its ordering and grouping, the columns it reads, the relations it loads, the
+// assignments of its updates, and the field an aggregate such as ant.SumOf reads
+// of it. A subquery may name its outer query's models in its conditions and its
+// ordering, so a query is judged there only where it is plainly not one: when
+// its chain ends in a call that runs it, such as All, or when it sits inside an
+// outer query, whose models it may also name.
+func (c *checker) checkScope(call *ast.CallExpr, stack []ast.Node) {
 	pass := c.pass
 
-	selector, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
-	if !ok || selector.Sel.Name != "Where" {
+	if name := calleeName(pass, call); aggregates[name] && len(call.Args) == 3 {
+		if own := queryModels(pass.TypesInfo.TypeOf(call.Args[1])); own != nil {
+			c.judge(call.Args[2:], own, own, "ant."+name)
+		}
+
 		return
 	}
 
-	model := queryModel(pass.TypesInfo.TypeOf(selector.X))
-	if model == "" || joinsLater(stack) {
+	selector, ok := ast.Unparen(indexed(call.Fun)).(*ast.SelectorExpr)
+	if !ok || !isAntFunc(pass, call) {
 		return
 	}
 
-	allowed := []string{model}
+	own := queryModels(pass.TypesInfo.TypeOf(selector.X))
+	if own == nil {
+		return
+	}
 
-	if !c.runs(stack) {
-		outer, ok := c.outerModels(stack)
+	method := selector.Sel.Name
+
+	switch {
+	case method == "Where":
+		allowed, ok := c.scope(stack, own)
 		if !ok {
 			return
 		}
 
-		allowed = append(allowed, outer...)
-	}
+		for _, condition := range c.conditions(call.Args) {
+			if name := calleeName(pass, condition); singleModel[name] {
+				c.judge(fieldFuncs[name].of(condition.Args), allowed, own, "")
+			}
+		}
+	case fieldMethods[method] == byScope:
+		if allowed, ok := c.scope(stack, own); ok {
+			c.judge(first.of(call.Args), allowed, own, method)
+		}
+	case fieldMethods[method] == byOwn:
+		c.judge(first.of(call.Args), own, own, method)
+	case updates[method] && len(call.Args) > 0:
+		for _, arg := range call.Args[1:] {
+			assignment, ok := ast.Unparen(arg).(*ast.CallExpr)
+			if !ok {
+				continue
+			}
 
-	for _, condition := range c.conditions(call.Args) {
-		if !singleModel[calleeName(pass, condition)] || len(condition.Args) == 0 {
+			if name := calleeName(pass, assignment); fieldFuncs[name] == first {
+				c.judge(first.of(assignment.Args), own, own, "ant."+name)
+			}
+		}
+	}
+}
+
+// judge reports each of fields whose probe's model is none of allowed. what
+// names the call that takes the field, or is "" for a condition.
+func (c *checker) judge(fields []ast.Expr, allowed, own []types.Type, what string) {
+	for _, field := range fields {
+		root, probe, _ := c.probeOf(field)
+		if probe == "" {
 			continue
 		}
 
-		if _, probe, _ := c.probeOf(condition.Args[0]); probe != "" &&
-			!slices.Contains(allowed, probe) {
-			pass.Reportf(
-				condition.Pos(),
-				"condition on %s in a query of %s",
-				short(probe),
-				short(model),
+		model := pointee(c.pass.TypesInfo.TypeOf(root))
+		if model == nil || slices.ContainsFunc(allowed, func(t types.Type) bool {
+			return types.Identical(t, model)
+		}) {
+			continue
+		}
+
+		if what == "" {
+			c.pass.Reportf(field.Pos(), "condition on %s in a query of %s", name(model), names(own))
+		} else {
+			c.pass.Reportf(
+				field.Pos(),
+				"%s on a field of %s in a query of %s",
+				what,
+				name(model),
+				names(own),
 			)
 		}
 	}
+}
+
+// scope returns the models that a query, whose call ends stack, may name where
+// a subquery may name its outer query's: its own, and those of the queries it is
+// a subquery of. It returns false where the analyzer cannot tell.
+func (c *checker) scope(stack []ast.Node, own []types.Type) ([]types.Type, bool) {
+	if c.joinsLater(stack) {
+		return nil, false
+	}
+
+	if c.runs(stack) {
+		return own, true
+	}
+
+	outer, ok := c.outerModels(stack)
+	if !ok {
+		return nil, false
+	}
+
+	return append(slices.Clone(own), outer...), true
 }
 
 // conditions returns the calls among args, with those that And, Or, and Not
@@ -881,34 +1219,113 @@ func (c *checker) conditions(args []ast.Expr) []*ast.CallExpr {
 
 // runs reports whether the chain that the innermost node of stack starts ends in
 // a call that runs the query, which leaves ant's builder types: All, Count,
-// Update. GroupBy and Join lead to other builders, and the chain goes on.
+// Update, or a function such as ant.SumOf. GroupBy and Join lead to other
+// builders, and the chain goes on, as it does through a function such as
+// ant.Project or ant.Merge that makes the query part of what it builds. A method
+// given its type arguments, as OrderBy[string] is, is followed past them. The
+// subquery of a lateral join, one in an outer query's arguments, and one handed
+// to a function of one's own do not run there.
 func (c *checker) runs(stack []ast.Node) bool {
 	node := stack[len(stack)-1]
 
-	for i := len(stack) - 2; i >= 1; i-- {
-		// Parentheses around a receiver change nothing.
-		if paren, ok := stack[i].(*ast.ParenExpr); ok && paren.X == node {
-			node = paren
+	for i := len(stack) - 2; i >= 0; i-- {
+		switch parent := stack[i].(type) {
+		case *ast.ParenExpr:
+			node = parent
+		case *ast.SelectorExpr:
+			call, at := calledAt(stack, i)
+			if call == nil || ast.Node(parent.X) != node {
+				return false
+			}
 
-			continue
-		}
+			if !builder(c.pass.TypesInfo.TypeOf(call)) {
+				return true
+			}
 
-		selector, ok := stack[i].(*ast.SelectorExpr)
-		if !ok || selector.X != node {
+			node, i = call, at
+		case *ast.CallExpr:
+			// Only a function given the query itself runs it or builds on it: one
+			// given a condition made of it, as ant.Exists makes, uses a subquery.
+			name := calleeName(c.pass, parent)
+
+			at := argIndex(parent, node)
+			if name == "" || at < 0 || !isQuery(c.pass.TypesInfo.TypeOf(parent.Args[at])) ||
+				lateral(name) && at != 0 {
+				return false
+			}
+
+			if !builder(c.pass.TypesInfo.TypeOf(parent)) {
+				return true
+			}
+
+			node = parent
+		default:
 			return false
 		}
+	}
 
-		next, ok := stack[i-1].(*ast.CallExpr)
-		if !ok || next.Fun != selector {
-			return false
+	return false
+}
+
+// calledAt returns the call of the method that stack[i] selects, past the type
+// arguments it may be given, and where the call is in stack, or nil.
+func calledAt(stack []ast.Node, i int) (*ast.CallExpr, int) {
+	fun, j := stack[i], i-1
+
+	if j >= 0 {
+		switch index := stack[j].(type) {
+		case *ast.IndexExpr:
+			if ast.Node(index.X) == fun {
+				fun, j = index, j-1
+			}
+		case *ast.IndexListExpr:
+			if ast.Node(index.X) == fun {
+				fun, j = index, j-1
+			}
 		}
+	}
 
-		if !builder(c.pass.TypesInfo.TypeOf(next)) {
-			return true
-		}
+	if j < 0 {
+		return nil, 0
+	}
 
-		node = next
-		i--
+	call, ok := stack[j].(*ast.CallExpr)
+	if !ok || ast.Node(call.Fun) != fun {
+		return nil, 0
+	}
+
+	return call, j
+}
+
+func isArg(call *ast.CallExpr, node ast.Node) bool { return argIndex(call, node) >= 0 }
+
+// argIndex returns which of call's arguments node is, or -1.
+func argIndex(call *ast.CallExpr, node ast.Node) int {
+	return slices.IndexFunc(call.Args, func(a ast.Expr) bool { return ast.Node(a) == node })
+}
+
+// lateral reports whether an ant function is a lateral join, whose subquery may
+// name the query it joins.
+func lateral(name string) bool { return strings.HasSuffix(name, "Lateral") }
+
+// joins reports whether a method or function of ant joins a model in.
+// IncludeJoined does not: it reads its row under an alias of its own, which
+// conditions cannot name.
+func joins(name string) bool {
+	return strings.Contains(name, "Join") && !strings.HasSuffix(name, "Joined")
+}
+
+// isQuery reports whether t is a query, which a function may run or build on,
+// rather than a condition or an expression made of one.
+func isQuery(t types.Type) bool {
+	named := antType(t)
+	if named == nil {
+		return false
+	}
+
+	switch named.Obj().Name() {
+	case "Query", "Table", "Join2", "Join3", "Projection":
+		return true
 	}
 
 	return false
@@ -916,47 +1333,45 @@ func (c *checker) runs(stack []ast.Node) bool {
 
 // builder reports whether t is one of ant's types for building a query, such as
 // *Query[T] or *Grouped, rather than what running one returns.
-func builder(t types.Type) bool {
-	if t == nil {
-		return false
-	}
-
-	t = types.Unalias(t)
-	if pointer, ok := t.(*types.Pointer); ok {
-		t = types.Unalias(pointer.Elem())
-	}
-
-	named, ok := t.(*types.Named)
-
-	return ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == antPath
-}
+func builder(t types.Type) bool { return antType(t) != nil }
 
 // outerModels returns the models of the queries that enclose the innermost node
 // of stack, and whether they are the whole scope: only queries it sits in the
-// arguments of count, as a chain's later calls belong to the same query, and an
-// enclosing builder whose model is unknown, such as a grouped query, or a
-// function of one's own, makes the scope unknown. So does an outermost query
-// that does not run where the test can see it, since it may itself be a
-// subquery of something built elsewhere.
-func (c *checker) outerModels(stack []ast.Node) ([]string, bool) {
+// arguments of count, as a chain's later calls belong to the same query, and so
+// does the query a lateral join takes its subquery to. An enclosing builder
+// whose models are unknown, such as a grouped query, or a function of one's own,
+// makes the scope unknown. So does an outermost query that does not run where
+// the analyzer can see it, since it may itself be a subquery of something built
+// elsewhere.
+func (c *checker) outerModels(stack []ast.Node) ([]types.Type, bool) {
 	var (
-		out       []string
+		out       []types.Type
 		outermost = -1
 	)
 
 	for i := len(stack) - 2; i >= 0; i-- {
 		call, ok := stack[i].(*ast.CallExpr)
-		if !ok || !slices.ContainsFunc(call.Args, func(a ast.Expr) bool {
-			return ast.Node(a) == stack[i+1]
-		}) {
+		if !ok || !isArg(call, stack[i+1]) {
 			continue
 		}
 
-		if name := calleeName(c.pass, call); isAntFunc(c.pass, call) && name != "" {
+		if name := calleeName(c.pass, call); name != "" {
+			switch at := argIndex(call, stack[i+1]); {
 			// Has and the Related functions open a scope of the related model,
 			// which the analyzer does not follow.
-			if strings.HasPrefix(name, "Has") || strings.HasSuffix(name, "Related") {
+			case strings.HasPrefix(name, "Has") || strings.HasSuffix(name, "Related"):
 				return nil, false
+			// A subquery in a join's conditions may name either side.
+			case joins(name) && at > 1:
+				return nil, false
+			case lateral(name) && at == 1:
+				models := queryModels(c.pass.TypesInfo.TypeOf(call.Args[0]))
+				if models == nil {
+					return nil, false
+				}
+
+				out = append(out, models...)
+				outermost = i
 			}
 
 			continue // ant.Exists, ant.SubOf, and the like pass a query on
@@ -967,12 +1382,12 @@ func (c *checker) outerModels(stack []ast.Node) ([]string, bool) {
 			return nil, false
 		}
 
-		model := queryModel(c.pass.TypesInfo.TypeOf(selector.X))
-		if model == "" {
+		models := queryModels(c.pass.TypesInfo.TypeOf(selector.X))
+		if models == nil {
 			return nil, false
 		}
 
-		out = append(out, model)
+		out = append(out, models...)
 		outermost = i
 	}
 
@@ -983,22 +1398,27 @@ func (c *checker) outerModels(stack []ast.Node) ([]string, bool) {
 	return out, true
 }
 
-// joinsLater reports whether the chain goes on to a join, since a condition can
-// come before the join that brings its model in. IncludeJoined brings in none
-// that conditions can name, as it reads its row under an alias of its own.
-func joinsLater(stack []ast.Node) bool {
-	for _, n := range stack {
-		if selector, ok := n.(*ast.SelectorExpr); ok &&
-			strings.Contains(selector.Sel.Name, "Join") &&
-			!strings.HasSuffix(selector.Sel.Name, "Joined") {
-			return true
+// joinsLater reports whether the query goes on to a join, by a method of its
+// chain or of an outer one, or as the query a join function such as ant.JoinSub
+// takes first, since a condition can come before the join that brings its model
+// in.
+func (c *checker) joinsLater(stack []ast.Node) bool {
+	for i, n := range stack {
+		switch n := n.(type) {
+		case *ast.SelectorExpr:
+			if joins(n.Sel.Name) {
+				return true
+			}
+		case *ast.CallExpr:
+			if i+1 < len(stack) && len(n.Args) > 0 && ast.Node(n.Args[0]) == stack[i+1] &&
+				joins(calleeName(c.pass, n)) {
+				return true
+			}
 		}
 	}
 
 	return false
 }
-
-func short(name string) string { return name[strings.LastIndex(name, ".")+1:] }
 
 // checkFind reports a Find key of the wrong type, for a model whose key is its ID
 // field, or the single field its Configure method makes the key.
@@ -1013,20 +1433,20 @@ func checkFind(pass *analysis.Pass, call *ast.CallExpr) {
 		return
 	}
 
-	name := "ID"
+	path := "ID"
 
 	if named, ok := model.(*types.Named); ok {
 		fact := new(keyFact)
 		if pass.ImportObjectFact(named.Obj(), fact) {
-			name = fact.Field
+			path = fact.Field
 		}
 	}
 
-	if name == "" {
+	if path == "" {
 		return
 	}
 
-	id := lookupPath(pass, model, name)
+	id := lookupPath(pass, model, path)
 	if id == nil {
 		return
 	}
@@ -1040,7 +1460,7 @@ func checkFind(pass *analysis.Pass, call *ast.CallExpr) {
 		call.Args[1].Pos(),
 		"Find key is %s, and %s has a key of type %s",
 		types.TypeString(key, nil),
-		short(types.TypeString(model, nil)),
+		name(model),
 		types.TypeString(id.Type(), nil),
 	)
 }

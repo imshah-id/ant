@@ -15,3 +15,7 @@ func (Country) Configure(b *ant.ModelBuilder[Country]) {
 }
 
 var Co = ant.Fields[Country]() // want Co:"probe of models.Country"
+
+// Code is a type of this package that another package's model takes as a type
+// argument.
+type Code string

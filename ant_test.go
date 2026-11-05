@@ -138,6 +138,7 @@ func TestBuilderErrorsSurfaceAtTerminal(t *testing.T) {
 		{
 			"wrong model order",
 			func() error {
+				//antvet:ignore another model's field, on purpose: the test checks the error
 				_, err := posts.OrderBy(&U.Name).All(ctx)
 
 				return err
@@ -147,6 +148,7 @@ func TestBuilderErrorsSurfaceAtTerminal(t *testing.T) {
 		{
 			"wrong model assignment",
 			func() error {
+				//antvet:ignore another model's field, on purpose: the test checks the error
 				_, err := posts.Where().Update(ctx, ant.Set(&U.Age, 1))
 
 				return err
@@ -158,6 +160,7 @@ func TestBuilderErrorsSurfaceAtTerminal(t *testing.T) {
 			func() error {
 				var rel []post
 
+				//antvet:ignore not a probe, on purpose: the test checks the error
 				_, err := users.Include(&rel).All(ctx)
 
 				return err
@@ -170,6 +173,7 @@ func TestBuilderErrorsSurfaceAtTerminal(t *testing.T) {
 				type other struct{ ID int64 }
 
 				o := ant.Fields[other]()
+				//antvet:ignore another model's field, on purpose: the test checks the error
 				_, err := posts.Join(&P.User).Where(ant.Eq(&o.ID, int64(1))).
 					Select(func(p *post, u *user) string { return u.Name }).All(ctx)
 
@@ -180,6 +184,7 @@ func TestBuilderErrorsSurfaceAtTerminal(t *testing.T) {
 		{
 			"relation of an unjoined model",
 			func() error {
+				//antvet:ignore another model's field, on purpose: the test checks the error
 				_, err := posts.Include(&U.Posts).All(ctx)
 
 				return err

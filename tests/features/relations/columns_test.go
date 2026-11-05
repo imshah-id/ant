@@ -49,6 +49,7 @@ func TestColumns(t *testing.T) {
 		})
 
 		t.Run("a column of another model", func(t *testing.T) {
+			//antvet:ignore another model's field, on purpose: the test checks the error
 			_, err := db.Users.Column(&P.Title).All(ctx)
 			require.ErrorIs(t, err, ant.ErrWrongModel)
 		})
