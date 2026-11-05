@@ -20,10 +20,11 @@ import (
 // full name, as go test prints it. Some matches pass anyway, such as a write
 // the guard refuses before any SQL runs, so an entry is checked as a whole: one
 // that matches combinations but sees none fail is fixed, and fails the test, so
-// that the list only holds what is still broken.
+// that the list only holds what is still broken. The first entry that matches
+// takes the combination, so a narrower pattern goes before a broader one.
 var known = []*knownFailure{
-	{pattern: `/Union_of_paged_sides/`, issue: "#8, fixed by PR #16"},
 	{pattern: `^TestMatrix/(mysql|mariadb)/.*/offset_3/(Update|Delete)$`, issue: "#22"},
+	{pattern: `/Union_of_paged_sides/`, issue: "#8, fixed by PR #16"},
 	{pattern: `^TestMatrix/sqlserver/(FromCTE|Recursive)/.*/(Count|Exists)$`, issue: "#23"},
 	{pattern: `^TestMatrix/sqlserver/Recursive/.*/(All|First|Include)$`, issue: "#46"},
 }

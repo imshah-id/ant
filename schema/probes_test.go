@@ -750,8 +750,6 @@ func knownProbe(t *testing.T, issue string) {
 }
 
 func runProbe(t *testing.T, c probe) {
-	knownScenario(t, c.name, false)
-
 	p := prUnique(t)
 	old, next := c.build(p)
 
@@ -761,7 +759,12 @@ func runProbe(t *testing.T, c probe) {
 		sb = prNewSandbox(t, p)
 	}
 
-	prMigrate(t, sb, p, old, next, prFill(p, c.renames), prFill(p, c.seed), c.forbid, c.verify)
+	// Each direction is its own subtest, so a known failure skips only its own
+	// direction: prMigrate builds the old schema afresh every time.
+	t.Run("forward", func(t *testing.T) {
+		knownScenario(t, c.name, false)
+		prMigrate(t, sb, p, old, next, prFill(p, c.renames), prFill(p, c.seed), c.forbid, c.verify)
+	})
 
 	if c.back {
 		t.Run("back", func(t *testing.T) {
