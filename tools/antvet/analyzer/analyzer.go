@@ -166,21 +166,59 @@ func findProbes(pass *analysis.Pass, in *inspector.Inspector) map[types.Object]s
 		}
 	})
 
-	// A copy may come before what it copies is assigned, so this goes round
-	// until no more variables turn out to hold probes.
+	// A copy may come before what it copies is assigned, and copies may go round
+	// a cycle, as in q := p, then p = q. So every assigned variable starts out
+	// as a candidate, and those given anything but a probe or a candidate drop
+	// out, until none do.
+	candidate := map[types.Object]bool{}
+
+	for object := range assigned {
+		candidate[object] = true
+	}
+
+	for dropped := true; dropped; {
+		dropped = false
+
+		for object := range candidate {
+			for _, value := range assigned[object] {
+				if value == nil ||
+					probeSource(pass, value) == "" &&
+						!candidate[objectOf(pass, ast.Unparen(value))] {
+					delete(candidate, object)
+
+					dropped = true
+
+					break
+				}
+			}
+		}
+	}
+
+	// A candidate holds the probe that reaches it through copies, from
+	// ant.Fields or another package. One that no probe reaches only copies the
+	// others, and holds nil.
 	locals := map[types.Object]string{}
 
 	for found := true; found; {
 		found = false
 
-		for object, values := range assigned {
+		for object := range candidate {
 			if _, done := locals[object]; done {
 				continue
 			}
 
-			if model := heldModel(pass, locals, values); model != "" {
-				locals[object] = model
-				found = true
+			for _, value := range assigned[object] {
+				model := probeSource(pass, value)
+				if model == "" {
+					model = locals[objectOf(pass, ast.Unparen(value))]
+				}
+
+				if model != "" {
+					locals[object] = model
+					found = true
+
+					break
+				}
 			}
 		}
 	}
@@ -192,29 +230,6 @@ func findProbes(pass *analysis.Pass, in *inspector.Inspector) map[types.Object]s
 	}
 
 	return locals
-}
-
-// heldModel returns the model of the probe that each of values is, or "" if one
-// is not, or is not known to be yet.
-func heldModel(pass *analysis.Pass, locals map[types.Object]string, values []ast.Expr) string {
-	model := ""
-
-	for _, value := range values {
-		if value == nil {
-			return ""
-		}
-
-		model = probeSource(pass, value)
-		if object := objectOf(pass, ast.Unparen(value)); model == "" && object != nil {
-			model = locals[object]
-		}
-
-		if model == "" {
-			return ""
-		}
-	}
-
-	return model
 }
 
 // quieted returns pass with its reports dropped on lines that //antvet:ignore

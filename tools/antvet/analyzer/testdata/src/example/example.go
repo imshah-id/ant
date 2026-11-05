@@ -347,6 +347,27 @@ func reassigned(ctx context.Context, users *ant.Table[User]) {
 
 func loaded() (*User, error) { return &User{}, nil }
 
+// Variables that copy each other hold a probe if one reaches them from
+// ant.Fields and nothing else is ever assigned to them.
+func cycles(ctx context.Context, users *ant.Table[User]) {
+	p := ant.Fields[User]()
+	q := p
+	p = q
+	users.Where(ant.Gt(&p.Age, 1), ant.Eq(&q.Name, "x")).All(ctx)
+
+	r := ant.Fields[User]()
+	s := r
+	r = s
+	s = &User{}
+	users.Where(ant.Gt(&r.Age, 1)).All(ctx)    // want `not of an ordinary variable`
+	users.Where(ant.Eq(&s.Name, "x")).All(ctx) // want `not of an ordinary variable`
+
+	var a, b *User
+	a = b
+	b = a
+	users.Where(ant.Gt(&a.Age, 1)).All(ctx) // want `not of an ordinary variable`
+}
+
 // A type parameter's model is known only where the function is instantiated.
 func generic[T any](ctx context.Context, q *ant.Query[T], rows *ant.Table[Row[T]]) {
 	q.Where(ant.Gt(&U.Age, 1)).All(ctx)
