@@ -82,6 +82,29 @@ func TestCTE(t *testing.T) {
 			require.Equal(t, []string{"a", "a1", "root"}, names(got))
 		})
 
+		// The starting rows keep their own ordering and paging: here the last
+		// root by name, and the second, which are both root.
+		t.Run("a paged start", func(t *testing.T) {
+			roots := db.Branches.Where(ant.IsNull(&Br.ParentID))
+
+			for _, start := range []*ant.Query[Branch]{
+				roots.OrderByDesc(&Br.Name).Limit(1),
+				roots.OrderBy(&Br.Name).Offset(1).Limit(1),
+			} {
+				got, err := start.Recursive(&Br.Children).OrderBy(&Br.Name).All(ctx)
+				require.NoError(t, err)
+				require.Equal(t, []string{"a", "a1", "b", "root"}, names(got))
+			}
+
+			got, err := db.Branches.Where(ant.Eq(&Br.ID, leaf.ID)).
+				OrderBy(&Br.Name).
+				RecursiveOne(&Br.Parent).
+				OrderBy(&Br.Name).
+				All(ctx)
+			require.NoError(t, err, "an ordering without paging changes nothing")
+			require.Equal(t, []string{"a", "a1", "root"}, names(got))
+		})
+
 		t.Run("the result is a normal query", func(t *testing.T) {
 			n, err := db.Branches.Where(ant.Eq(&Br.ID, root.ID)).
 				Recursive(&Br.Children).

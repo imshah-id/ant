@@ -999,11 +999,8 @@ func (q *Query[T]) set(kind string, all bool, other *Query[T]) *Query[T] {
 		return n
 	}
 
-	combined := q.statement(q.selection())
-	combined.Sets = append(
-		combined.Sets,
-		qb.SetOp{Kind: kind, All: all, Select: other.statement(other.selection())},
-	)
+	combined := q.member()
+	combined.Sets = append(combined.Sets, qb.SetOp{Kind: kind, All: all, Select: other.member()})
 
 	out := newQuery[T](q.state)
 	out.noTracking = q.noTracking
@@ -1012,6 +1009,26 @@ func (q *Query[T]) set(kind string, all bool, other *Query[T]) *Query[T] {
 	out.fromFiltered = setFiltered(kind, q.narrowed(), other.narrowed())
 
 	return out
+}
+
+// member returns q as one side of a set operation. Its ordering and paging are
+// its own, but a SELECT's ORDER BY and LIMIT would apply to the whole set, and
+// some databases refuse them on a member. So a paged member becomes a derived
+// table, and an ordering with no paging, which cannot change which rows a set
+// holds, is left out.
+func (q *Query[T]) member() *qb.Select {
+	stmt := q.statement(q.selection())
+
+	if stmt.Limit == nil && stmt.Offset == nil {
+		stmt.Order = nil
+
+		return stmt
+	}
+
+	return &qb.Select{
+		Columns: []qb.Selected{{Value: qb.Star{}}},
+		From:    qb.Source{Sub: stmt, Alias: q.model().Table.Name},
+	}
 }
 
 // setFiltered reports whether a set operation can leave rows out, so that a
@@ -1030,8 +1047,9 @@ func setFiltered(kind string, left, right bool) bool {
 	}
 }
 
-// Union returns the rows of q or other, without duplicates. Conditions, ordering,
-// and paging added afterward apply to the combined rows.
+// Union returns the rows of q or other, without duplicates. Each side's own
+// ordering and paging pick its rows first, and conditions, ordering, and paging
+// added afterward apply to the combined rows.
 func (q *Query[T]) Union(other *Query[T]) *Query[T] { return q.set("UNION", false, other) }
 
 // UnionAll is Union, keeping duplicates.
@@ -1092,7 +1110,7 @@ func recursive[T, V any](q *Query[T], rel *V) *Query[T] {
 		}},
 	}
 
-	seed := q.statement(q.selection())
+	seed := q.member()
 	seed.Sets = []qb.SetOp{{Kind: "UNION", Select: step}}
 	out.with = []qb.CTE{{Name: recursiveName, Select: seed}}
 	out.recursive = true

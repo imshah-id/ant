@@ -1,8 +1,10 @@
 package tests
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -725,5 +727,320 @@ func TestConformanceLateralJoin(t *testing.T) {
 
 		require.NoError(t, err)
 		require.Equal(t, []string{"newer"}, newest)
+	})
+}
+
+// A set operation's members keep their own ordering and paging: the youngest
+// two users, united with the oldest one, are three users, not the youngest of
+// all six. Every pair of member shapes is checked against the same rows worked
+// out in Go, for each kind of set operation.
+func TestConformanceSetMembers(t *testing.T) {
+	people := []struct {
+		name string
+		age  int
+	}{{"alice", 30}, {"bob", 25}, {"carol", 35}, {"dan", 40}, {"eve", 20}}
+
+	// pick works out a member's rows in Go, from people sorted by less.
+	pick := func(keep func(age int) bool, less func(a, b int) bool, offset, limit int) []string {
+		var rows []int
+
+		for i, p := range people {
+			if keep(p.age) {
+				rows = append(rows, i)
+			}
+		}
+
+		slices.SortFunc(rows, func(a, b int) int {
+			if less(a, b) {
+				return -1
+			}
+
+			return 1
+		})
+
+		rows = rows[min(offset, len(rows)):]
+
+		if limit >= 0 {
+			rows = rows[:min(limit, len(rows))]
+		}
+
+		out := make([]string, len(rows))
+
+		for i, r := range rows {
+			out[i] = people[r].name
+		}
+
+		return out
+	}
+
+	all := func(int) bool { return true }
+	byAge := func(a, b int) bool { return people[a].age < people[b].age }
+	byAgeDesc := func(a, b int) bool { return people[a].age > people[b].age }
+	byName := func(a, b int) bool { return people[a].name < people[b].name }
+
+	members := []struct {
+		name  string
+		shape func(q *ant.Query[User]) *ant.Query[User]
+		rows  []string
+	}{
+		{
+			"filtered",
+			func(q *ant.Query[User]) *ant.Query[User] { return q.Where(ant.Gt(&U.Age, 22)) },
+			pick(func(age int) bool { return age > 22 }, byName, 0, -1),
+		},
+		{
+			"youngest two",
+			func(q *ant.Query[User]) *ant.Query[User] { return q.OrderBy(&U.Age).Limit(2) },
+			pick(all, byAge, 0, 2),
+		},
+		{
+			"second oldest",
+			func(q *ant.Query[User]) *ant.Query[User] {
+				return q.OrderByDesc(&U.Age).Offset(1).Limit(1)
+			},
+			pick(all, byAgeDesc, 1, 1),
+		},
+		{
+			"ordered, not paged",
+			func(q *ant.Query[User]) *ant.Query[User] { return q.OrderByDesc(&U.Name) },
+			pick(all, byName, 0, -1),
+		},
+		{
+			"offset alone",
+			func(q *ant.Query[User]) *ant.Query[User] { return q.OrderBy(&U.Name).Offset(3) },
+			pick(all, byName, 3, -1),
+		},
+		{
+			"filtered and paged",
+			func(q *ant.Query[User]) *ant.Query[User] {
+				return q.Where(ant.Lt(&U.Age, 30)).OrderByDesc(&U.Age).Limit(1)
+			},
+			pick(func(age int) bool { return age < 30 }, byAgeDesc, 0, 1),
+		},
+	}
+
+	kinds := []struct {
+		name    string
+		combine func(a, b *ant.Query[User]) *ant.Query[User]
+		rows    func(a, b []string) []string
+	}{
+		{"Union", (*ant.Query[User]).Union, func(a, b []string) []string {
+			return slices.Compact(slices.Sorted(slices.Values(append(slices.Clone(a), b...))))
+		}},
+		{"UnionAll", (*ant.Query[User]).UnionAll, func(a, b []string) []string {
+			return slices.Sorted(slices.Values(append(slices.Clone(a), b...)))
+		}},
+		{"Intersect", (*ant.Query[User]).Intersect, func(a, b []string) []string {
+			return slices.Sorted(
+				slices.Values(slices.DeleteFunc(slices.Clone(a), func(s string) bool {
+					return !slices.Contains(b, s)
+				})),
+			)
+		}},
+		{"Except", (*ant.Query[User]).Except, func(a, b []string) []string {
+			return slices.Sorted(
+				slices.Values(slices.DeleteFunc(slices.Clone(a), func(s string) bool {
+					return slices.Contains(b, s)
+				})),
+			)
+		}},
+	}
+
+	testdb.ForEach(t, func(t *testing.T, target testdb.Target) {
+		app := openApp(t, target)
+		ctx := t.Context()
+
+		for _, p := range people {
+			seedUsers(t, app, p.name, p.age)
+		}
+
+		for _, kind := range kinds {
+			for _, left := range members {
+				for _, right := range members {
+					name := kind.name + "/" + left.name + "/" + right.name
+
+					t.Run(name, func(t *testing.T) {
+						q := kind.combine(
+							left.shape(app.Users.Query()),
+							right.shape(app.Users.Query()),
+						)
+
+						got, err := q.OrderBy(&U.Name).All(ctx)
+						require.NoError(t, err)
+
+						want := kind.rows(left.rows, right.rows)
+						if want == nil {
+							want = []string{}
+						}
+
+						require.Equal(t, want, names(got))
+					})
+				}
+			}
+		}
+
+		youngTwo := app.Users.OrderBy(&U.Age).Limit(2)   // eve, bob
+		oldest := app.Users.OrderByDesc(&U.Age).Limit(1) // dan
+		thirty := app.Users.Where(ant.Eq(&U.Age, 30))    // alice
+
+		byName := func(t *testing.T, q *ant.Query[User]) []string {
+			t.Helper()
+
+			got, err := q.OrderBy(&U.Name).All(ctx)
+			require.NoError(t, err)
+
+			return names(got)
+		}
+
+		t.Run("nested sets", func(t *testing.T) {
+			want := []string{"alice", "bob", "dan", "eve"}
+			require.Equal(t, want, byName(t, youngTwo.Union(oldest).Union(thirty)))
+			require.Equal(t, want, byName(t, youngTwo.Union(oldest.Union(thirty))))
+		})
+
+		t.Run("a paged set as a member", func(t *testing.T) {
+			firstTwo := youngTwo.Union(oldest).OrderBy(&U.Name).Limit(2) // bob, dan
+			require.Equal(t, []string{"alice", "bob", "dan"}, byName(t, firstTwo.Union(thirty)))
+			require.Equal(t, []string{"bob"}, byName(t, firstTwo.Intersect(youngTwo)))
+		})
+
+		t.Run("counted", func(t *testing.T) {
+			n, err := youngTwo.Union(oldest).Count(ctx)
+			require.NoError(t, err)
+			require.EqualValues(t, 3, n)
+		})
+
+		// A limit is not a condition, so each side has one for the write guard.
+		t.Run("an update changes the members' rows only", func(t *testing.T) {
+			adults := app.Users.Where(ant.Gt(&U.Age, 0))
+			changed, err := adults.OrderBy(&U.Age).Limit(2).
+				Union(adults.OrderByDesc(&U.Age).Limit(1)).
+				Update(ctx, ant.Inc(&U.Age, 100))
+			require.NoError(t, err)
+			require.EqualValues(t, 3, changed)
+
+			old, err := app.Users.Where(ant.Gt(&U.Age, 100)).OrderBy(&U.Name).All(ctx)
+			require.NoError(t, err)
+			require.Equal(t, []string{"bob", "dan", "eve"}, names(old))
+
+			_, err = app.Users.Where(ant.Gt(&U.Age, 100)).Update(ctx, ant.Inc(&U.Age, -100))
+			require.NoError(t, err)
+		})
+
+		t.Run("a delete removes the members' rows only", func(t *testing.T) {
+			removed, err := app.Users.OrderBy(&U.Age).Limit(3). // eve, bob, alice
+										Intersect(app.Users.Where(ant.Gt(&U.Age, 22))).
+										Delete(ctx)
+			require.NoError(t, err)
+			require.EqualValues(t, 2, removed)
+			require.Equal(t, []string{"carol", "dan", "eve"}, byName(t, app.Users.Query()))
+		})
+	})
+}
+
+// Ledger is a versioned model with a unique code, for upserts.
+type Ledger struct {
+	ID      int64
+	Code    string
+	Total   int
+	Version int64 `ant:"version"`
+}
+
+func (Ledger) Configure(b *ant.ModelBuilder[Ledger]) {
+	b.Table("ledgers")
+	b.Index(&Lg.Code).Unique()
+}
+
+var Lg = ant.Fields[Ledger]()
+
+type LedgerDB struct {
+	ant.Context
+	Ledgers ant.Table[Ledger]
+}
+
+// An upsert that updates moves the version on, as every write does. Where the
+// database takes a condition on an upsert, a copy that carries a version updates
+// only that version. ON DUPLICATE KEY takes none, so on MySQL and MariaDB the
+// copy's update goes ahead.
+func TestConformanceUpsertVersion(t *testing.T) {
+	testdb.ForEach(t, func(t *testing.T, target testdb.Target) {
+		ctx := t.Context()
+		_, err := target.DB.ExecContext(ctx, `CREATE TABLE ledgers (
+			id BIGINT PRIMARY KEY,
+			code VARCHAR(20) NOT NULL UNIQUE,
+			total INT NOT NULL,
+			version BIGINT NOT NULL)`)
+		require.NoError(t, err)
+
+		t.Cleanup(func() {
+			_, _ = target.DB.ExecContext(context.Background(), "DROP TABLE ledgers")
+		})
+
+		db, err := ant.Open[LedgerDB](ctx, target.Dialect, target.DSN)
+		require.NoError(t, err)
+		t.Cleanup(func() { db.Close() })
+
+		onCode := ant.OnConflict(&Lg.Code)
+
+		if !has(target, dialect.OnConflict) {
+			_, err := db.Ledgers.Upsert(ctx, &Ledger{ID: 1, Code: "a"}, onCode)
+			require.ErrorIs(t, err, ant.ErrUnsupported)
+
+			return
+		}
+
+		version := func() int64 {
+			stored, err := db.Ledgers.NoTracking().Where(ant.Eq(&Lg.Code, "a")).First(ctx)
+			require.NoError(t, err)
+
+			return stored.Version
+		}
+
+		_, err = db.Ledgers.Upsert(ctx, &Ledger{ID: 1, Code: "a", Total: 1}, onCode)
+		require.NoError(t, err)
+		require.EqualValues(t, 1, version())
+
+		for i, conflict := range []*ant.Conflict{
+			onCode,
+			onCode.DoUpdate(ant.F(&Lg.Total)),
+			onCode.Set(ant.Inc(&Lg.Total, 1)),
+		} {
+			fresh := &Ledger{ID: 2, Code: "a", Total: 5}
+			_, err = db.Ledgers.Upsert(ctx, fresh, conflict)
+			require.NoError(t, err)
+			require.EqualValues(t, i+2, version(), "the version moves on, not back to 1")
+			require.EqualValues(t, i+2, fresh.Version)
+		}
+
+		_, err = db.Ledgers.Upsert(
+			ctx,
+			&Ledger{
+				ID:      1,
+				Code:    "a",
+				Total:   9,
+				Version: 1,
+			},
+			onCode,
+		)
+
+		if has(target, dialect.ConflictWhere) {
+			require.ErrorIs(t, err, ant.ErrConcurrency, "a stale copy is refused")
+			require.EqualValues(t, 4, version())
+		} else {
+			require.NoError(t, err, "ON DUPLICATE KEY has no condition")
+			require.EqualValues(t, 5, version())
+		}
+
+		n, err := db.Ledgers.InsertMany(ctx,
+			[]*Ledger{{ID: 3, Code: "a", Total: 1}, {ID: 4, Code: "b", Total: 1}},
+			ant.WithConflict(onCode))
+		require.NoError(t, err)
+		require.Positive(t, n)
+
+		stored, err := db.Ledgers.NoTracking().OrderBy(&Lg.Code).All(ctx)
+		require.NoError(t, err)
+		require.Equal(t, version(), stored[0].Version)
+		require.Greater(t, stored[0].Version, int64(1), "InsertMany moved it on too")
+		require.EqualValues(t, 1, stored[1].Version)
 	})
 }

@@ -188,7 +188,7 @@ go run ./cmd/migrate diff rename_bio --rename users.bio=about
 go run ./cmd/migrate diff rename_table --rename users=people
 ```
 
-Without either, the file warns and shows the statement to use instead, so you can edit it by hand. Constraints and indexes follow a rename by themselves, and are renamed, not rebuilt.
+Without either, the file warns and shows the statement to use instead, so you can edit it by hand. Constraints and indexes follow a rename by themselves, and are renamed, not rebuilt. The new name must be one the models have and the snapshot does not, in the same schema, so a misspelled `--rename users=peple` stops `diff` with the names it could have meant, and writes nothing.
 
 **Generated columns keep what depends on them.** PostgreSQL before 17 cannot change a generated column's expression, so a new one means dropping the column and adding it again, and the drop takes its indexes and constraints with it. The file drops them first and makes them again after, along with foreign keys that point at the column, or at a unique index rebuilt with it. Such a file must run whole or not at all, so every index in it is built in its transaction, even with `Concurrently()`, and a warning names each one that asked to be built online. To build one online anyway, give it a migration of its own.
 

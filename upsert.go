@@ -107,18 +107,24 @@ func (c *Conflict) Set(assignments ...Assignment) *Conflict {
 	return &n
 }
 
-// clause returns the ON CONFLICT clause for a model.
-func (c *Conflict) clause(model *meta.Model) *qb.Conflict {
+// clause returns the ON CONFLICT clause for a model. An update moves the version
+// on, as every write does, so a copy loaded before it cannot save over it. The
+// version is ant's to keep, so naming it is an error.
+func (c *Conflict) clause(model *meta.Model) (*qb.Conflict, error) {
 	out := &qb.Conflict{Columns: c.columns}
 
 	if c.nothing {
-		return out
+		return out, nil
+	}
+
+	if err := managedVersion(model, c.update, c.set); err != nil {
+		return nil, err
 	}
 
 	names := c.update
 	if len(names) == 0 && len(c.set) == 0 {
 		for _, f := range model.Updatable() {
-			if !slices.Contains(c.columns, f.Column) {
+			if !slices.Contains(c.columns, f.Column) && f != model.Version {
 				names = append(names, f.Column)
 			}
 		}
@@ -133,7 +139,49 @@ func (c *Conflict) clause(model *meta.Model) *qb.Conflict {
 
 	out.Set = append(out.Set, c.set...)
 
-	return out
+	if v := model.Version; v != nil {
+		out.Set = append(out.Set, nextVersion(model))
+	}
+
+	return out, nil
+}
+
+// managedVersion refuses a write that names the version column, which ant moves
+// on by itself.
+func managedVersion(model *meta.Model, columns []string, set []qb.Assignment) error {
+	v := model.Version
+	if v == nil {
+		return nil
+	}
+
+	if slices.Contains(columns, v.Column) ||
+		slices.ContainsFunc(set, func(a qb.Assignment) bool { return a.Column == v.Column }) {
+		return fmt.Errorf(
+			"ant: %s.%s is a version, which ant moves on by itself; leave it out",
+			model.Type.Name(),
+			v.Name,
+		)
+	}
+
+	return nil
+}
+
+// one is a literal 1, which takes no parameter: InsertMany fills a statement
+// with as many rows as the parameter limit allows.
+var one = qb.Fragment{SQL: "1"}
+
+// nextVersion is the assignment that moves the stored version on by one.
+func nextVersion(model *meta.Model) qb.Assignment {
+	v := model.Version
+
+	return qb.Assignment{
+		Column: v.Column,
+		Value: qb.Binary{
+			Left:  qb.Column{Table: model.Table, Name: v.Column},
+			Op:    "+",
+			Right: one,
+		},
+	}
 }
 
 // insertStatement returns a one-row INSERT for e. Generated zero keys are left
@@ -192,11 +240,19 @@ func (t *Table[T]) Upsert(ctx context.Context, e *T, conflict *Conflict) (bool, 
 		return false, fmt.Errorf("%w: %s", ErrReadOnly, model.Type.Name())
 	}
 
+	clause, err := conflict.clause(model)
+	if err != nil {
+		return false, err
+	}
+
+	// A copy that carries a version updates only the row it was loaded from.
+	checked := t.versionCheck(model, unsafe.Pointer(e), clause)
+
 	n := &node{model: model, entity: unsafe.Pointer(e)}
 	newUnit(t.state).stamp(n)
 
 	stmt := insertStatement(model, unsafe.Pointer(e))
-	stmt.Conflict = conflict.clause(model)
+	stmt.Conflict = clause
 
 	rows, err := t.upsertRows(ctx, model, stmt, unsafe.Pointer(e))
 	if err == nil {
@@ -208,7 +264,12 @@ func (t *Table[T]) Upsert(ctx context.Context, e *T, conflict *Conflict) (bool, 
 			f.Value(n.entity).SetZero()
 		}
 
-		if errors.Is(err, ErrNotFound) {
+		switch {
+		case errors.Is(err, ErrNotFound) && checked:
+			key, _ := model.KeyOf(unsafe.Pointer(e))
+
+			return false, &ConcurrencyError{Model: model.Type.Name(), Key: key}
+		case errors.Is(err, ErrNotFound):
 			return false, nil
 		}
 
@@ -226,6 +287,28 @@ func (t *Table[T]) Upsert(ctx context.Context, e *T, conflict *Conflict) (bool, 
 	}
 
 	return true, nil
+}
+
+// versionCheck limits the conflict's update to the version e carries, if any, and
+// reports whether it did. A zero version is a new entity, which has none to
+// check. ON DUPLICATE KEY takes no condition, so there the update goes ahead.
+func (t *Table[T]) versionCheck(model *meta.Model, e unsafe.Pointer, c *qb.Conflict) bool {
+	v := model.Version
+
+	switch {
+	case v == nil, len(c.Set) == 0, v.Value(e).IsZero():
+		return false
+	case !dialect.Supports(t.state.dialect, dialect.ConflictWhere):
+		return false
+	}
+
+	c.Where = append(c.Where, qb.Compare{
+		Left:  qb.Column{Table: model.Table, Name: v.Column},
+		Op:    qb.OpEq,
+		Right: qb.Param{Value: v.Value(e).Interface()},
+	})
+
+	return true
 }
 
 // upsertRows runs an upsert and returns the stored row, or ErrNotFound if it did
@@ -257,7 +340,9 @@ func (t *Table[T]) upsertRows(
 	switch {
 	case err != nil:
 		return nil, err
-	case changed == 0 && len(stmt.Conflict.Set) == 0:
+	// No row changed: the conflict did nothing, or its condition, such as a
+	// copy's version, turned the update down.
+	case changed == 0 && (len(stmt.Conflict.Set) == 0 || len(stmt.Conflict.Where) > 0):
 		return nil, ErrNotFound
 	}
 
@@ -331,6 +416,12 @@ func (t *Table[T]) InsertMany(
 
 	if model.ReadOnly {
 		return 0, fmt.Errorf("%w: %s", ErrReadOnly, model.Type.Name())
+	}
+
+	if o.conflict != nil {
+		if _, err := o.conflict.clause(model); err != nil {
+			return 0, err
+		}
 	}
 
 	stamper := newUnit(t.state)
@@ -445,7 +536,12 @@ func (t *Table[T]) insertBatch(
 	}
 
 	if conflict != nil {
-		stmt.Conflict = conflict.clause(model)
+		clause, err := conflict.clause(model)
+		if err != nil {
+			return 0, err
+		}
+
+		stmt.Conflict = clause
 
 		return t.state.runOn(ctx, to, stmt)
 	}

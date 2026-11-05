@@ -583,6 +583,179 @@ func TestRenames(t *testing.T) {
 		},
 	)
 
+	// A rename is there to keep data. One whose new name the models do not have
+	// would rename a table and then drop it as unknown, so it is refused, and so
+	// is one onto a name that is already taken.
+	t.Run(
+		"a rename must land on a name the models have and the snapshot lacks",
+		func(t *testing.T) {
+			people := users()
+			people.Name = "people"
+
+			withMail := users()
+			withMail.Column("email").Name = "mail"
+			withMail.Column("bio").Name = "about"
+
+			orders := &schema.Table{
+				Schema:  "sales",
+				Name:    "orders",
+				Columns: []*schema.Column{{Name: "id", Type: "bigint"}},
+			}
+
+			purchases := &schema.Table{
+				Schema:  "sales",
+				Name:    "purchases",
+				Columns: []*schema.Column{{Name: "id", Type: "bigint"}},
+			}
+
+			cases := []struct {
+				name    string
+				from    *schema.Schema
+				to      *schema.Schema
+				renames []string
+				err     string
+			}{
+				{
+					"a table, misspelled",
+					of(users(), posts()),
+					of(people, posts()),
+					[]string{"users=peple"},
+					"models have no table peple; new tables in the models: people",
+				},
+				{
+					"a table, onto a table the snapshot has",
+					of(users(), posts()),
+					of(people, posts()),
+					[]string{"users=posts"},
+					"the snapshot already has a table posts",
+				},
+				{
+					"a table, to its own name",
+					of(users()),
+					of(users()),
+					[]string{"users=users"},
+					"the snapshot already has a table users",
+				},
+				{
+					"two tables to one name",
+					of(users(), posts()),
+					of(people),
+					[]string{"users=people", "posts=people"},
+					"the snapshot already has a table people",
+				},
+				{
+					"a table onto one migrations leave alone",
+					&schema.Schema{
+						Tables:    []*schema.Table{users()},
+						Unmanaged: []schema.Ref{{Name: "people"}},
+					},
+					of(people),
+					[]string{"users=people"},
+					"a table people already exists, outside migrations",
+				},
+				{
+					"a table, where the only new one exists outside migrations",
+					&schema.Schema{
+						Tables:    []*schema.Table{users()},
+						Unmanaged: []schema.Ref{{Name: "people"}},
+					},
+					of(people),
+					[]string{"users=peple"},
+					"models have no table peple; the models have no new table",
+				},
+				{
+					"a table into another schema",
+					of(orders),
+					of(purchases),
+					[]string{"sales.orders=archive.orders"},
+					"models have no table archive.orders in schema sales",
+				},
+				{
+					"a table, with nothing new to rename it to",
+					of(users()),
+					of(users()),
+					[]string{"users=people"},
+					"models have no table people; the models have no new table",
+				},
+				{
+					"a column, onto a column the snapshot has",
+					of(users()),
+					of(withMail),
+					[]string{"users.email=name"},
+					"table users already has a column name",
+				},
+				{
+					"a column, to its own name",
+					of(users()),
+					of(users()),
+					[]string{"users.email=email"},
+					"table users already has a column email",
+				},
+				{
+					"two columns to one name",
+					of(users()),
+					of(withMail),
+					[]string{"users.email=mail", "users.bio=mail"},
+					"table users already has a column mail",
+				},
+				{
+					"a column, misspelled",
+					of(users()),
+					of(withMail),
+					[]string{"users.email=mial"},
+					"models have no column users.mial; new columns of users in the models: mail, about",
+				},
+			}
+
+			for _, tt := range cases {
+				t.Run(tt.name, func(t *testing.T) {
+					plan, err := schema.Diff(tt.from, tt.to, tt.renames...)
+					require.ErrorContains(t, err, tt.err)
+					require.Nil(t, plan)
+				})
+			}
+
+			valid := []struct {
+				name    string
+				from    *schema.Schema
+				to      *schema.Schema
+				renames []string
+				want    []string
+			}{
+				{
+					"a table in a schema",
+					of(orders),
+					of(purchases),
+					[]string{"sales.orders=purchases"},
+					[]string{`ALTER TABLE "sales"."orders" RENAME TO "purchases"`},
+				},
+				{
+					"a column of a table renamed before it",
+					of(users()),
+					of(func() *schema.Table {
+						t := users()
+						t.Name = "people"
+						t.Column("email").Name = "mail"
+
+						return t
+					}()),
+					[]string{"users=people", "people.email=mail"},
+					[]string{
+						`ALTER TABLE "users" RENAME TO "people"`,
+						`ALTER TABLE "people" RENAME COLUMN "email" TO "mail"`,
+					},
+				},
+			}
+
+			for _, tt := range valid {
+				t.Run("still allowed: "+tt.name, func(t *testing.T) {
+					got := run(t, tt.from, tt.to, tt.renames...)
+					require.Subset(t, got, tt.want)
+				})
+			}
+		},
+	)
+
 	t.Run("a drop and add of one type is a hint, not a guess", func(t *testing.T) {
 		next := users()
 		next.Column("bio").Name = "about"

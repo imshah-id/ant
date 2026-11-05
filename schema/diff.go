@@ -237,11 +237,16 @@ func (s *Schema) rename(text string, to *Schema) (Change, error) {
 			ref.Schema = parts[0]
 		}
 
-		if t := s.Table(ref); t != nil {
-			return s.renameTable(t, name), nil
+		t := s.Table(ref)
+		if t == nil {
+			return nil, fmt.Errorf("ant: rename %q: no table %s in the snapshot", text, ref)
 		}
 
-		return nil, fmt.Errorf("ant: rename %q: no table %s in the snapshot", text, ref)
+		if err := s.canRenameTable(t, name, to); err != nil {
+			return nil, fmt.Errorf("ant: rename %q: %w", text, err)
+		}
+
+		return s.renameTable(t, name), nil
 	}
 
 	ref := Ref{Name: parts[0]}
@@ -262,13 +267,101 @@ func (s *Schema) rename(text string, to *Schema) (Change, error) {
 		return nil, fmt.Errorf("ant: rename %q: no column %s in table %s", text, column, ref)
 	}
 
-	if target := to.Table(ref); target == nil || target.Column(name) == nil {
-		return nil, fmt.Errorf("ant: rename %q: models have no column %s.%s", text, ref, name)
+	if err := canRenameColumn(t, name, to); err != nil {
+		return nil, fmt.Errorf("ant: rename %q: %w", text, err)
 	}
 
 	s.renameColumn(t, c, name)
 
 	return RenameColumn{Table: ref, From: column, To: name}, nil
+}
+
+// canRenameTable checks that t's new name is a table the models have, in t's
+// schema, and that the snapshot does not have yet. A rename to a name the models
+// lack would be followed by a drop of the renamed table, losing what the rename
+// was meant to keep.
+func (s *Schema) canRenameTable(t *Table, name string, to *Schema) error {
+	ref := Ref{t.Schema, name}
+
+	if s.Table(ref) != nil {
+		return fmt.Errorf("the snapshot already has a table %s", ref)
+	}
+
+	if slices.Contains(s.Unmanaged, ref) {
+		return fmt.Errorf("a table %s already exists, outside migrations", ref)
+	}
+
+	if to.Table(ref) != nil {
+		return nil
+	}
+
+	var fresh []string
+
+	for _, candidate := range to.Tables {
+		if candidate.Schema == t.Schema && s.Table(candidate.Ref()) == nil &&
+			!slices.Contains(s.Unmanaged, candidate.Ref()) {
+			fresh = append(fresh, candidate.Name)
+		}
+	}
+
+	where := ""
+
+	if t.Schema != "" {
+		where = " in schema " + t.Schema
+	}
+
+	if len(fresh) == 0 {
+		return fmt.Errorf("models have no table %s%s; the models have no new table", name, where)
+	}
+
+	return fmt.Errorf(
+		"models have no table %s%s; new tables in the models: %s",
+		name,
+		where,
+		strings.Join(fresh, ", "),
+	)
+}
+
+// canRenameColumn checks that a column of t can take the new name: the models'
+// table has it, and t does not yet.
+func canRenameColumn(t *Table, name string, to *Schema) error {
+	if t.Column(name) != nil {
+		return fmt.Errorf("table %s already has a column %s", t.Ref(), name)
+	}
+
+	target := to.Table(t.Ref())
+	if target == nil {
+		return fmt.Errorf("models have no table %s", t.Ref())
+	}
+
+	if target.Column(name) != nil {
+		return nil
+	}
+
+	var fresh []string
+
+	for _, c := range target.Columns {
+		if t.Column(c.Name) == nil {
+			fresh = append(fresh, c.Name)
+		}
+	}
+
+	if len(fresh) == 0 {
+		return fmt.Errorf(
+			"models have no column %s.%s; %s has no new column in the models",
+			t.Ref(),
+			name,
+			t.Ref(),
+		)
+	}
+
+	return fmt.Errorf(
+		"models have no column %s.%s; new columns of %s in the models: %s",
+		t.Ref(),
+		name,
+		t.Ref(),
+		strings.Join(fresh, ", "),
+	)
 }
 
 func (s *Schema) renameTable(t *Table, name string) Change {

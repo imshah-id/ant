@@ -9,8 +9,9 @@ import (
 	"github.com/skudra-go/ant/tests/features/fixture"
 )
 
-// Union, Intersect, and Except combine queries of one model. Conditions and
-// ordering added afterward apply to the combined rows.
+// Union, Intersect, and Except combine queries of one model. Each side keeps its
+// own paging, and conditions and ordering added afterward apply to the combined
+// rows.
 func TestSetOperations(t *testing.T) {
 	fixture.Run(t, func(t *testing.T, db *fixture.AppDB) {
 		fixture.Seed(t, db)
@@ -50,6 +51,17 @@ func TestSetOperations(t *testing.T) {
 			got, err := young.Union(old).OrderByDesc(&U.Age).Limit(1).All(ctx)
 			require.NoError(t, err)
 			require.Equal(t, []string{"Carol"}, fixture.Names(got))
+		})
+
+		// A side's own ordering and paging pick its rows before they combine:
+		// the youngest user, and the oldest.
+		t.Run("each side keeps its own paging", func(t *testing.T) {
+			youngest := db.Users.OrderBy(&U.Age).Limit(1)
+			oldest := db.Users.OrderByDesc(&U.Age).Limit(1)
+
+			got, err := youngest.Union(oldest).OrderBy(&U.Name).All(ctx)
+			require.NoError(t, err)
+			require.Equal(t, []string{"Bob", "Carol"}, fixture.Names(got))
 		})
 
 		t.Run("chained", func(t *testing.T) {

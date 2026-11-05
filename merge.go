@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"slices"
 	"unsafe"
 
 	"github.com/skudra-go/ant/internal/meta"
@@ -171,7 +172,46 @@ func (m *Merger[T]) Exec(ctx context.Context) (int64, error) {
 
 	stmt := m.stmt
 
+	model, err := m.table.model()
+	if err != nil {
+		return 0, err
+	}
+
+	if stmt.Actions, err = versioned(model, stmt.Actions); err != nil {
+		return 0, err
+	}
+
 	return m.table.state.run(ctx, &stmt)
+}
+
+// versioned keeps a model's version as other writes do: an update moves it on,
+// so a copy loaded before cannot save over it, and an insert starts it at 1
+// unless the source gives one.
+func versioned(model *meta.Model, actions []qb.MergeAction) ([]qb.MergeAction, error) {
+	v := model.Version
+	if v == nil {
+		return actions, nil
+	}
+
+	out := slices.Clone(actions)
+
+	for i, a := range out {
+		switch {
+		case a.Matched && len(a.Set) > 0:
+			if err := managedVersion(model, nil, a.Set); err != nil {
+				return nil, err
+			}
+
+			a.Set = append(slices.Clone(a.Set), nextVersion(model))
+		case !a.Matched && len(a.Columns) > 0 && !slices.Contains(a.Columns, v.Column):
+			a.Columns = append(slices.Clone(a.Columns), v.Column)
+			a.Values = append(slices.Clone(a.Values), one)
+		}
+
+		out[i] = a
+	}
+
+	return out, nil
 }
 
 // BulkRows is entities prepared for a bulk loader outside ant, such as COPY.

@@ -401,6 +401,26 @@ A plan that replaces a column builds and drops every index without `CONCURRENTLY
 
 A column that stops being generated is not replaced: `DROP EXPRESSION` (PostgreSQL 13) keeps its values and everything on it. Before this, it was dropped and added empty, which lost the data, or failed on a `NOT NULL` column with rows.
 
+## 80. Every write moves the version on
+
+An upsert that updated copied every column from the row it tried to insert, the version included, and `Insert` starts a version at 1. So the stored version went back to 1, and a copy loaded at version 1, two saves earlier, matched again and saved over both. `DoUpdate` and `Set` left the version where it was, which hid the upsert from every copy loaded before it. `Merge` did the same, and `InsertMany` with a conflict shares the upsert's clause.
+
+Now each of them moves the stored version on by one when it updates a row, as `SaveChanges` and bulk `Update` do, and a row `Merge` inserts starts at 1 unless the source gives a version. The version is ant's to keep, so naming it in `DoUpdate`, `Set`, or a `Merge` assignment is an error before anything runs.
+
+An entity passed to `Upsert` with a version of its own is a loaded copy, so its update applies only while the stored row still has that version, and otherwise `Upsert` returns a `ConcurrencyError`, as `SaveChanges` would. A zero version is a new entity, with nothing to check. `ON DUPLICATE KEY UPDATE` takes no condition, so on MySQL and MariaDB the version moves on but the copy's update goes ahead. `InsertMany` cannot tell a row's own version from the 1 it stamps on a new one, so it moves versions on without checking them.
+
+## 81. A set operation's members keep their own paging
+
+`Union` built its statement from the left query and appended the right one, so the left query's `ORDER BY`, `LIMIT`, and `OFFSET` were written after the right member, where SQL applies them to the whole set. The youngest two users united with the oldest came back as the youngest of all three, a `Delete` on such a set removed rows outside it, and an ordering by a table's column failed on PostgreSQL, which orders a set only by its output columns. SQLite writes members without parentheses, so there the right member's paging escaped too, and SQL Server and SQLite refuse an ordered member outright.
+
+Each member is now built on its own. A paged member becomes a derived table, `SELECT * FROM (... LIMIT 2) AS users`, which every database reads as one member. A member that orders without paging loses its order, since order cannot change which rows a set holds. `Recursive` takes its starting rows the same way. `TestConformanceSetMembers` checks every pair of six member shapes under each of the four operations, on all five databases.
+
+## 82. A rename must land on a name the models have
+
+`--rename` is there to keep data, but a table rename never checked its new name. `--rename users=peple` renamed the table to the typo, created `people` empty from the models, and dropped `peple` as a table the models no longer had, with every row in it. Column renames checked the models, but not the snapshot, so a column renamed onto one that already existed planned a statement the database refuses.
+
+Now a rename's new name must be a table or column the models have, in the table's own schema, and one the snapshot does not have yet, which also catches two renames onto one name and a rename to the same name. Otherwise `diff` stops before writing anything, and the error lists the tables or columns that are new in the models, since a typo is usually one of them. A rename into another schema is refused for the same reason: the plan would move nothing, and drop the table.
+
 ## 83. antvet judges only what it can see
 
 `antvet` flagged valid code in ant's own tests, so nobody could run it on a project and trust the result. Three things caused it. Models were named with `types.TypeString`, which since Go 1.23 keeps an alias's own name, so a query of `type User = fixture.User` was "a query of User" that a probe of `fixture.User` did not match. `Find` keys were checked against a field named `ID`, though `Configure` can make another field the key. And a condition on another model was reported in any query, though a subquery may name its outer query's model, as decision 37 allows.
