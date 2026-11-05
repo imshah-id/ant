@@ -7,7 +7,9 @@ package analyzer
 import (
 	"fmt"
 	"go/ast"
+	"go/token"
 	"go/types"
+	"reflect"
 	"slices"
 	"strings"
 
@@ -20,8 +22,9 @@ import (
 const antPath = "github.com/skudra-go/ant"
 
 // Analyzer reports field pointers that are not probes, probes of the wrong model,
-// and Find keys of the wrong type. A comment //antvet:ignore on the line of a
-// report, or on the line above it, silences it, for code that is wrong on purpose.
+// and Find keys of the wrong type. A comment //antvet:ignore at the end of a
+// report's line, or on a line of its own above it, silences it, for code that is
+// wrong on purpose.
 var Analyzer = &analysis.Analyzer{
 	Name:      "antvet",
 	Doc:       "check ant queries for what the compiler cannot see",
@@ -68,6 +71,11 @@ var fieldTaking = map[string]bool{
 	"ILike":     true,
 	"IsNull":    true,
 	"IsNotNull": true,
+	"Past":      true,
+	"Future":    true,
+	"Today":     true,
+	"InSub":     true,
+	"NotInSub":  true,
 	"Set":       true,
 	"SetExpr":   true,
 	"Inc":       true,
@@ -83,22 +91,50 @@ func run(pass *analysis.Pass) (any, error) {
 	in := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 	locals := map[types.Object]string{}
 
-	in.Preorder([]ast.Node{(*ast.AssignStmt)(nil)}, func(n ast.Node) {
-		assign := n.(*ast.AssignStmt)
-		if len(assign.Lhs) != len(assign.Rhs) {
+	// A variable is a probe however it gets one: declared with var or :=,
+	// assigned with =, as a package variable is in init, or copied from another.
+	keep := func(id *ast.Ident, value ast.Expr) {
+		object := pass.TypesInfo.ObjectOf(id)
+		if object == nil {
 			return
 		}
 
-		for i, left := range assign.Lhs {
-			id, ok := left.(*ast.Ident)
-			if !ok {
-				continue
+		model := probeSource(pass, value)
+		if from, ok := ast.Unparen(value).(*ast.Ident); ok && model == "" {
+			model = locals[pass.TypesInfo.Uses[from]]
+		}
+
+		if model == "" {
+			return
+		}
+
+		locals[object] = model
+
+		// Other packages see a package variable set in init through a fact.
+		if object.Parent() == pass.Pkg.Scope() {
+			pass.ExportObjectFact(object, &probeFact{model})
+		}
+	}
+
+	in.Preorder([]ast.Node{(*ast.AssignStmt)(nil), (*ast.ValueSpec)(nil)}, func(n ast.Node) {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			if len(n.Lhs) != len(n.Rhs) {
+				return
 			}
 
-			if model := probeSource(pass, assign.Rhs[i]); model != "" {
-				if object := pass.TypesInfo.Defs[id]; object != nil {
-					locals[object] = model
+			for i, left := range n.Lhs {
+				if id, ok := left.(*ast.Ident); ok {
+					keep(id, n.Rhs[i])
 				}
+			}
+		case *ast.ValueSpec:
+			if len(n.Names) != len(n.Values) {
+				return
+			}
+
+			for i, name := range n.Names {
+				keep(name, n.Values[i])
 			}
 		}
 	})
@@ -161,7 +197,8 @@ func findProbes(pass *analysis.Pass) {
 }
 
 // quieted returns pass with its reports dropped on lines that //antvet:ignore
-// covers: its own, and the one below it.
+// covers: its own, and the one below it if the comment has a line to itself. One
+// at the end of a line of code covers only that line.
 func quieted(pass *analysis.Pass) *analysis.Pass {
 	ignored := map[string]bool{}
 
@@ -174,7 +211,10 @@ func quieted(pass *analysis.Pass) *analysis.Pass {
 
 				at := pass.Fset.Position(comment.Pos())
 				ignored[fmt.Sprintf("%s:%d", at.Filename, at.Line)] = true
-				ignored[fmt.Sprintf("%s:%d", at.Filename, at.Line+1)] = true
+
+				if alone(pass, comment.Pos()) {
+					ignored[fmt.Sprintf("%s:%d", at.Filename, at.Line+1)] = true
+				}
 			}
 		}
 	}
@@ -190,6 +230,25 @@ func quieted(pass *analysis.Pass) *analysis.Pass {
 	}
 
 	return &out
+}
+
+// alone reports whether only spaces come before the comment at pos on its line,
+// as the file has it, whatever //line directives say. If the file cannot be
+// read, the comment is taken to be alone, as it covers more then.
+func alone(pass *analysis.Pass, pos token.Pos) bool {
+	at := pass.Fset.PositionFor(pos, false)
+	start := at.Offset - at.Column + 1
+
+	if pass.ReadFile == nil {
+		return true
+	}
+
+	content, err := pass.ReadFile(at.Filename)
+	if err != nil || start < 0 || at.Offset > len(content) {
+		return true
+	}
+
+	return strings.TrimSpace(string(content[start:at.Offset])) == ""
 }
 
 // findKeys records the key that each model's Configure method sets.
@@ -646,7 +705,8 @@ func queryModel(t types.Type) string {
 	return ""
 }
 
-// queryArg returns T of a *Query[T] or *Table[T], unaliased, or nil.
+// queryArg returns T of a *Query[T] or *Table[T], unaliased, or nil, as it is
+// when T holds a type parameter, which only an instantiation fills in.
 func queryArg(t types.Type) types.Type {
 	if t == nil {
 		return nil
@@ -668,7 +728,29 @@ func queryArg(t types.Type) types.Type {
 		return nil
 	}
 
-	return unalias(named.TypeArgs().At(0))
+	if model := unalias(named.TypeArgs().At(0)); !generic(model) {
+		return model
+	}
+
+	return nil
+}
+
+// generic reports whether t holds a type parameter.
+func generic(t types.Type) bool {
+	switch t := types.Unalias(t).(type) {
+	case *types.TypeParam:
+		return true
+	case *types.Named:
+		for arg := range t.TypeArgs().Types() {
+			if generic(arg) {
+				return true
+			}
+		}
+	case interface{ Elem() types.Type }:
+		return generic(t.Elem())
+	}
+
+	return false
 }
 
 // singleModel lists conditions that name one column of the query's own model.
@@ -687,6 +769,11 @@ var singleModel = map[string]bool{
 	"ILike":     true,
 	"IsNull":    true,
 	"IsNotNull": true,
+	"Past":      true,
+	"Future":    true,
+	"Today":     true,
+	"InSub":     true,
+	"NotInSub":  true,
 }
 
 // checkWhere reports a condition on a model other than the query's. A subquery's
@@ -717,9 +804,8 @@ func (c *checker) checkWhere(call *ast.CallExpr, stack []ast.Node) {
 		allowed = append(allowed, outer...)
 	}
 
-	for _, arg := range call.Args {
-		condition, ok := ast.Unparen(arg).(*ast.CallExpr)
-		if !ok || !singleModel[calleeName(pass, condition)] || len(condition.Args) == 0 {
+	for _, condition := range c.conditions(call.Args) {
+		if !singleModel[calleeName(pass, condition)] || len(condition.Args) == 0 {
 			continue
 		}
 
@@ -733,6 +819,28 @@ func (c *checker) checkWhere(call *ast.CallExpr, stack []ast.Node) {
 			)
 		}
 	}
+}
+
+// conditions returns the calls among args, with those that And, Or, and Not
+// combine in place of them, since those are on the same query.
+func (c *checker) conditions(args []ast.Expr) []*ast.CallExpr {
+	var out []*ast.CallExpr
+
+	for _, arg := range args {
+		call, ok := ast.Unparen(arg).(*ast.CallExpr)
+		if !ok {
+			continue
+		}
+
+		switch calleeName(c.pass, call) {
+		case "And", "Or", "Not":
+			out = append(out, c.conditions(call.Args)...)
+		default:
+			out = append(out, call)
+		}
+	}
+
+	return out
 }
 
 // runs reports whether the chain that the innermost node of stack starts ends in
@@ -840,11 +948,13 @@ func (c *checker) outerModels(stack []ast.Node) ([]string, bool) {
 }
 
 // joinsLater reports whether the chain goes on to a join, since a condition can
-// come before the join that brings its model in.
+// come before the join that brings its model in. IncludeJoined brings in none
+// that conditions can name, as it reads its row under an alias of its own.
 func joinsLater(stack []ast.Node) bool {
 	for _, n := range stack {
 		if selector, ok := n.(*ast.SelectorExpr); ok &&
-			strings.Contains(selector.Sel.Name, "Join") {
+			strings.Contains(selector.Sel.Name, "Join") &&
+			!strings.HasSuffix(selector.Sel.Name, "Joined") {
 			return true
 		}
 	}
@@ -857,7 +967,7 @@ func short(name string) string { return name[strings.LastIndex(name, ".")+1:] }
 // checkFind reports a Find key of the wrong type, for a model whose key is its ID
 // field, or the single field its Configure method makes the key.
 func checkFind(pass *analysis.Pass, call *ast.CallExpr) {
-	selector, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
+	selector, ok := ast.Unparen(indexed(call.Fun)).(*ast.SelectorExpr)
 	if !ok || selector.Sel.Name != "Find" || len(call.Args) != 2 {
 		return
 	}
@@ -917,19 +1027,31 @@ func lookupPath(pass *analysis.Pass, t types.Type, path string) *types.Var {
 	return field
 }
 
+// compatible reports whether Find takes a key of type got for a key field of
+// type want, as ant's own check does: the same type, any integer for an integer,
+// or a type of the same kind that converts to it.
 func compatible(want, got types.Type) bool {
-	if types.Identical(want, got) {
-		return true
+	return types.Identical(want, got) ||
+		integer(want) && integer(got) ||
+		sameKind(want, got) && types.ConvertibleTo(got, want)
+}
+
+func integer(t types.Type) bool {
+	basic, ok := t.Underlying().(*types.Basic)
+
+	return ok && basic.Info()&types.IsInteger != 0
+}
+
+// sameKind reports whether reflect gives a and b the same Kind: the same basic
+// type underneath, or the same sort of type, such as two arrays.
+func sameKind(a, b types.Type) bool {
+	x, y := a.Underlying(), b.Underlying()
+
+	if bx, ok := x.(*types.Basic); ok {
+		by, ok := y.(*types.Basic)
+
+		return ok && bx.Kind() == by.Kind()
 	}
 
-	a, aok := want.Underlying().(*types.Basic)
-
-	b, bok := got.Underlying().(*types.Basic)
-	if !aok || !bok {
-		return false
-	}
-
-	both := func(info types.BasicInfo) bool { return a.Info()&info != 0 && b.Info()&info != 0 }
-
-	return both(types.IsInteger) || both(types.IsString)
+	return reflect.TypeOf(x) == reflect.TypeOf(y)
 }

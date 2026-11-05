@@ -2,6 +2,7 @@ package example
 
 import (
 	"context"
+	"time"
 
 	"github.com/skudra-go/ant"
 
@@ -12,12 +13,14 @@ type User struct {
 	ID    int64
 	Age   int
 	Name  string
+	At    time.Time
 	Posts []Post
 }
 
 type Post struct {
 	ID     string
 	UserID int64
+	User   *User
 }
 
 // Member is User under another name, as a test package might alias a fixture.
@@ -282,4 +285,65 @@ func onPurpose(ctx context.Context, users *ant.Table[User]) {
 
 	//antvet:ignore so is this one
 	users.Find(ctx, "1")
+}
+
+// Conditions that And, Or, and Not combine are on the query they are given to,
+// and so are those of Past and InSub. A joined include brings in no model the
+// conditions can name.
+func scopes(ctx context.Context, users *ant.Table[User], posts *ant.Table[Post]) {
+	posts.Where(ant.Or(ant.Gt(&P.UserID, 1), ant.Eq(&P.ID, "x"))).All(ctx)
+	users.Where(ant.Or(ant.Exists(posts.Where(ant.Gt(&U.Age, 18))))).All(ctx)
+	users.Where(ant.Exists(posts.Where(ant.Not(ant.Gt(&U.Age, 18))))).All(ctx)
+	users.Where(ant.Or(ant.Has(&U.Posts, ant.Eq(&P.ID, "x")))).All(ctx)
+	users.Where(ant.Past(&U.At), ant.InSub(&U.ID, ant.SubOf(posts.Where(), &P.UserID))).All(ctx)
+
+	posts.Where(ant.Or(ant.Gt(&U.Age, 18), ant.Eq(&P.ID, "x"))).All(ctx)    // want `condition on User in a query of Post`
+	posts.Where(ant.Not(ant.And(ant.Gt(&U.Age, 18)))).Count(ctx)            // want `condition on User in a query of Post`
+	posts.Where(ant.Gt(&U.Age, 18)).IncludeJoined(&P.User).All(ctx)         // want `condition on User in a query of Post`
+	posts.Where(ant.Past(&U.At)).All(ctx)                                   // want `condition on User in a query of Post`
+	posts.Where(ant.InSub(&U.ID, ant.SubOf(users.Where(), &U.ID))).All(ctx) // want `condition on User in a query of Post`
+	user := &User{}
+	ant.Past(&user.At) // want `not of an ordinary variable`
+}
+
+// Late is a probe set in init.
+var Late *User // want Late:"probe of example.User"
+
+func init() { Late = ant.Fields[User]() }
+
+// Probes held in variables of a function, however they are declared, are
+// probes.
+func held(ctx context.Context, users *ant.Table[User]) {
+	var declared = ant.Fields[User]()
+	users.Where(ant.Gt(&declared.Age, 1)).All(ctx)
+
+	var assigned *User
+	assigned = ant.Fields[User]()
+	users.Where(ant.Gt(&assigned.Age, 1)).All(ctx)
+
+	copied := declared
+	users.Where(ant.Gt(&copied.Age, 1), ant.Eq(&Late.Name, "x")).All(ctx)
+}
+
+// A type parameter's model is known only where the function is instantiated.
+func generic[T any](ctx context.Context, q *ant.Query[T], rows *ant.Table[Row[T]]) {
+	q.Where(ant.Gt(&U.Age, 1)).All(ctx)
+	rows.Find(ctx, 1)
+}
+
+// Ref is a key of its own type, which ant takes a key of the same kind for.
+type Ref [4]byte
+
+type Tagged struct {
+	ID Ref
+}
+
+func findKinds(ctx context.Context, tagged *ant.Table[Tagged], users *ant.Table[User]) {
+	tagged.Find(ctx, [4]byte{})
+	tagged.Find(ctx, "x")        // want `Find key is string, and Tagged has a key of type example.Ref`
+	users.Find[string](ctx, "1") // want `Find key is string, and User has a key of type int64`
+
+	x := 5
+	ant.Gt(&x, 2)        //antvet:ignore a comment at the end of a line covers that line only
+	users.Find(ctx, "2") // want `Find key is string, and User has a key of type int64`
 }

@@ -127,6 +127,7 @@ func TestBuilderErrorsSurfaceAtTerminal(t *testing.T) {
 		{
 			"wrong model nested in Or",
 			func() error {
+				//antvet:ignore another model's probe in Or, on purpose: the test checks the error
 				_, err := posts.Where(ant.Or(ant.Eq(&P.Published, true), ant.Gt(&U.Age, 18))).
 					All(ctx)
 
