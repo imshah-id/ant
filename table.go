@@ -199,6 +199,13 @@ func (t *Table[T]) DeleteByID[K comparable](ctx context.Context, key K) error {
 		return err
 	}
 
+	ctx, release, err := t.state.claim(ctx, t.state.touchesTracker())
+	if err != nil {
+		return err
+	}
+
+	defer release()
+
 	q := t.query()
 	q.where = keyEquals(model, field, key)
 	q.filtered = true
@@ -276,12 +283,25 @@ func (t *Table[T]) Reload(ctx context.Context, e *T) error {
 		return err
 	}
 
+	entry := t.state.tracker.Get(unsafe.Pointer(e))
+	before := *e
+
 	if err := readInto(rows, e); err != nil {
 		return err
 	}
 
-	if entry := t.state.tracker.Get(unsafe.Pointer(e)); entry != nil {
-		entry.Saved(track.Unchanged)
+	if entry != nil {
+		// In a transaction, a rollback takes the read back with the rows it
+		// read: the values, and the state and snapshot.
+		undo := entry.Reloaded(func() {
+			for _, f := range model.Stored() {
+				f.Value(unsafe.Pointer(e)).Set(f.Value(unsafe.Pointer(&before)))
+			}
+		})
+
+		if t.state.tx != nil {
+			t.state.onRollback(undo)
+		}
 	}
 
 	return nil

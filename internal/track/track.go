@@ -43,7 +43,6 @@ type Entry struct {
 	keyed    bool
 	seq      uint64
 	saves    uint64 // counts writes saved, so an undo can tell it came too late
-	loads    uint64 // counts changes to Members and Parents, likewise
 	// Members holds the entries of a loaded one-to-many relation by key, and
 	// Parents the key of a loaded many-to-one relation, to detect changes.
 	Members map[*meta.Relation]map[any]*Entry
@@ -126,7 +125,6 @@ func (e *Entry) SetMembers(r *meta.Relation, members map[any]*Entry) {
 
 	next[r] = members
 	e.Members = next
-	e.loads++
 }
 
 // SetParent records the key a loaded many-to-one relation holds.
@@ -138,7 +136,6 @@ func (e *Entry) SetParent(r *meta.Relation, key any) {
 
 	next[r] = key
 	e.Parents = next
-	e.loads++
 }
 
 // SetLinks replaces what the loaded relations hold, and returns how to undo that.
@@ -148,16 +145,27 @@ func (e *Entry) SetLinks(
 ) (undo func()) {
 	oldMembers, oldParents := e.Members, e.Parents
 	e.Members, e.Parents = members, parents
-	e.loads++
-	loads := e.loads
 
-	// A newer load knows better what the relations hold, so it stands.
-	return func() {
-		if e.loads == loads {
-			e.Members, e.Parents = oldMembers, oldParents
-			e.loads = loads - 1
-		}
-	}
+	// This undo always applies. A load made inside the same transaction read
+	// rows the rollback takes back, and one made outside it read the committed
+	// rows, which are what this restores.
+	return func() { e.Members, e.Parents = oldMembers, oldParents }
+}
+
+// Reloaded records an entry as read back from the database, and returns how to
+// undo that: restore puts back the values the read replaced, and the undo the
+// state and snapshot, so that a rollback takes the read back with the rows it
+// read.
+func (e *Entry) Reloaded(restore func()) (undo func()) {
+	oldState, oldSnapshot := e.State, e.snapshot
+	e.State = Unchanged
+	e.Refresh()
+
+	return e.undoSave(func() {
+		restore()
+
+		e.State, e.snapshot = oldState, oldSnapshot
+	})
 }
 
 // undoSave returns restore for a rollback of a saved write, made safe against a
@@ -165,8 +173,9 @@ func (e *Entry) SetLinks(
 // of the tracker, and that operation may have saved the entry since. Its write
 // then stands, and an entry it left unchanged becomes Modified: neither write
 // knew what the other left in the database, so the next save writes every
-// column. Only saves count: loading a relation, or Add and Remove in memory, do
-// not make a rollback late.
+// column. Only saves, and reloads, count, and those made inside the same
+// transaction record undos of their own, which run first: loading a relation, or
+// Add and Remove in memory, do not make a rollback late.
 //
 // Undos run newest first, and each puts the count back to what it was before its
 // write, so the one before it still finds the entry as it left it.

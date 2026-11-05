@@ -385,14 +385,32 @@ func TestUndoAfterALaterChange(t *testing.T) {
 		}
 	})
 
-	t.Run("a newer load of the relations stands", func(t *testing.T) {
+	t.Run("a later load does not stop the relations coming back", func(t *testing.T) {
 		e := New().Track(m, unsafe.Pointer(&row{ID: 3}), Unchanged)
-		undo := e.SetLinks(nil, nil)
+		e.SetLinks(nil, nil)
+
+		undo := e.SetLinks(map[*meta.Relation]map[any]*Entry{nil: {}}, nil)
 		e.SetMembers(nil, map[any]*Entry{})
 		undo()
 
-		if e.Members == nil {
-			t.Fatal("the rollback took back a newer load")
+		if e.Members != nil {
+			t.Fatal("the rollback left the relations as a later load had them")
+		}
+	})
+
+	t.Run("a reload undoes with the values it replaced", func(t *testing.T) {
+		r := &row{ID: 4, Name: "before"}
+		e := New().Track(m, unsafe.Pointer(r), Added)
+
+		saved := e.Saved(Unchanged)
+		reloaded := e.Reloaded(func() { r.Name = "before" })
+		r.Name = "read"
+
+		reloaded()
+		saved()
+
+		if e.State != Added || r.Name != "before" {
+			t.Fatalf("state %s, name %q, want Added and before", e.State, r.Name)
 		}
 	})
 }
