@@ -85,59 +85,10 @@ var fieldTaking = map[string]bool{
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	findProbes(pass)
+	in := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+	locals := findProbes(pass, in)
 	findKeys(pass)
 	pass = quieted(pass)
-	in := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
-	locals := map[types.Object]string{}
-
-	// A variable is a probe however it gets one: declared with var or :=,
-	// assigned with =, as a package variable is in init, or copied from another.
-	keep := func(id *ast.Ident, value ast.Expr) {
-		object := pass.TypesInfo.ObjectOf(id)
-		if object == nil {
-			return
-		}
-
-		model := probeSource(pass, value)
-		if from, ok := ast.Unparen(value).(*ast.Ident); ok && model == "" {
-			model = locals[pass.TypesInfo.Uses[from]]
-		}
-
-		if model == "" {
-			return
-		}
-
-		locals[object] = model
-
-		// Other packages see a package variable set in init through a fact.
-		if object.Parent() == pass.Pkg.Scope() {
-			pass.ExportObjectFact(object, &probeFact{model})
-		}
-	}
-
-	in.Preorder([]ast.Node{(*ast.AssignStmt)(nil), (*ast.ValueSpec)(nil)}, func(n ast.Node) {
-		switch n := n.(type) {
-		case *ast.AssignStmt:
-			if len(n.Lhs) != len(n.Rhs) {
-				return
-			}
-
-			for i, left := range n.Lhs {
-				if id, ok := left.(*ast.Ident); ok {
-					keep(id, n.Rhs[i])
-				}
-			}
-		case *ast.ValueSpec:
-			if len(n.Names) != len(n.Values) {
-				return
-			}
-
-			for i, name := range n.Names {
-				keep(name, n.Values[i])
-			}
-		}
-	})
 
 	c := &checker{pass, locals}
 
@@ -166,34 +117,104 @@ type checker struct {
 	locals map[types.Object]string // probes in local variables
 }
 
-// findProbes records package variables set from ant.Fields, or from another probe.
-func findProbes(pass *analysis.Pass) {
-	for _, file := range pass.Files {
-		for _, decl := range file.Decls {
-			gen, ok := decl.(*ast.GenDecl)
-			if !ok {
+// findProbes returns the variables that hold probes, and tells other packages of
+// those at package level through a fact. A variable holds a probe if all that is
+// ever assigned to it is one: from ant.Fields, a probe of another package, or a
+// variable that holds one, wherever in the package that comes. A declaration
+// with no value does not count, so a package variable may be set in init. A
+// variable that is ever given anything else may hold that at any use, as the
+// analyzer does not follow the order code runs in, so it is an ordinary one.
+func findProbes(pass *analysis.Pass, in *inspector.Inspector) map[types.Object]string {
+	assigned := map[types.Object][]ast.Expr{}
+
+	// value is nil where one call gives several names theirs.
+	add := func(id *ast.Ident, values []ast.Expr, names, i int) {
+		object, ok := pass.TypesInfo.ObjectOf(id).(*types.Var)
+		if !ok {
+			return
+		}
+
+		var value ast.Expr
+
+		if len(values) == names {
+			value = values[i]
+		}
+
+		assigned[object] = append(assigned[object], value)
+	}
+
+	in.Preorder([]ast.Node{(*ast.AssignStmt)(nil), (*ast.ValueSpec)(nil)}, func(n ast.Node) {
+		switch n := n.(type) {
+		case *ast.AssignStmt:
+			if n.Tok != token.ASSIGN && n.Tok != token.DEFINE {
+				return
+			}
+
+			for i, left := range n.Lhs {
+				if id, ok := ast.Unparen(left).(*ast.Ident); ok {
+					add(id, n.Rhs, len(n.Lhs), i)
+				}
+			}
+		case *ast.ValueSpec:
+			if len(n.Values) == 0 {
+				return
+			}
+
+			for i, name := range n.Names {
+				add(name, n.Values, len(n.Names), i)
+			}
+		}
+	})
+
+	// A copy may come before what it copies is assigned, so this goes round
+	// until no more variables turn out to hold probes.
+	locals := map[types.Object]string{}
+
+	for found := true; found; {
+		found = false
+
+		for object, values := range assigned {
+			if _, done := locals[object]; done {
 				continue
 			}
 
-			for _, spec := range gen.Specs {
-				value, ok := spec.(*ast.ValueSpec)
-				if !ok || len(value.Names) != len(value.Values) {
-					continue
-				}
-
-				for i, name := range value.Names {
-					object := pass.TypesInfo.Defs[name]
-					if object == nil {
-						continue
-					}
-
-					if model := probeSource(pass, value.Values[i]); model != "" {
-						pass.ExportObjectFact(object, &probeFact{model})
-					}
-				}
+			if model := heldModel(pass, locals, values); model != "" {
+				locals[object] = model
+				found = true
 			}
 		}
 	}
+
+	for object, model := range locals {
+		if object.Parent() == pass.Pkg.Scope() {
+			pass.ExportObjectFact(object, &probeFact{model})
+		}
+	}
+
+	return locals
+}
+
+// heldModel returns the model of the probe that each of values is, or "" if one
+// is not, or is not known to be yet.
+func heldModel(pass *analysis.Pass, locals map[types.Object]string, values []ast.Expr) string {
+	model := ""
+
+	for _, value := range values {
+		if value == nil {
+			return ""
+		}
+
+		model = probeSource(pass, value)
+		if object := objectOf(pass, ast.Unparen(value)); model == "" && object != nil {
+			model = locals[object]
+		}
+
+		if model == "" {
+			return ""
+		}
+	}
+
+	return model
 }
 
 // quieted returns pass with its reports dropped on lines that //antvet:ignore

@@ -306,6 +306,12 @@ func scopes(ctx context.Context, users *ant.Table[User], posts *ant.Table[Post])
 	ant.Past(&user.At) // want `not of an ordinary variable`
 }
 
+// early copies Late, which init sets further down.
+func early(ctx context.Context, users *ant.Table[User]) {
+	local := Late
+	users.Where(ant.Gt(&local.Age, 1)).All(ctx)
+}
+
 // Late is a probe set in init.
 var Late *User // want Late:"probe of example.User"
 
@@ -324,6 +330,22 @@ func held(ctx context.Context, users *ant.Table[User]) {
 	copied := declared
 	users.Where(ant.Gt(&copied.Age, 1), ant.Eq(&Late.Name, "x")).All(ctx)
 }
+
+// A variable that is ever given anything but a probe may hold that at any use,
+// as the analyzer does not follow the order code runs in, so it is an ordinary
+// variable throughout.
+func reassigned(ctx context.Context, users *ant.Table[User]) {
+	p := &User{}
+	users.Where(ant.Gt(&p.Age, 1)).All(ctx) // want `not of an ordinary variable`
+	p = ant.Fields[User]()
+	users.Where(ant.Gt(&p.Age, 1)).All(ctx) // want `not of an ordinary variable`
+
+	q := ant.Fields[User]()
+	q, _ = loaded()
+	users.Where(ant.Gt(&q.Age, 1)).All(ctx) // want `not of an ordinary variable`
+}
+
+func loaded() (*User, error) { return &User{}, nil }
 
 // A type parameter's model is known only where the function is instantiated.
 func generic[T any](ctx context.Context, q *ant.Query[T], rows *ant.Table[Row[T]]) {
