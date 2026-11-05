@@ -2800,7 +2800,7 @@ func TestProbeDeterministic(t *testing.T) {
 		var first string
 
 		for i := 0; i < 5; i++ {
-			plan, err := schema.Diff(old, next, c.renames...)
+			plan, err := schema.Diff(old, next, prFill("pdet_", c.renames)...)
 			if err != nil {
 				break
 			}

@@ -182,36 +182,48 @@ func TestMatrix(t *testing.T) {
 		t.Skip("the matrix runs every combination, which takes about a minute")
 	}
 
-	testdb.ForEach(t, func(t *testing.T, target testdb.Target) {
-		create(t, target)
+	// The matrix keeps to tables of its own, so it connects without resetting the
+	// shared fixture tables, which other packages may be using at the time.
+	targets := testdb.Targets()
+	if len(targets) == 0 {
+		t.Skip("no database in ANT_TEST_DATABASES")
+	}
 
-		db, err := ant.Open[MatrixDB](
-			t.Context(),
-			target.Dialect,
-			target.DSN,
-			ant.WithTracking(false),
-		)
-		if err != nil {
-			t.Fatal(err)
-		}
+	for _, target := range targets {
+		t.Run(target.Name, func(t *testing.T) { matrix(t, target) })
+	}
+}
 
-		t.Cleanup(func() { db.Close() })
+func matrix(t *testing.T, target testdb.Target) {
+	target.Connect(t)
+	create(t, target)
 
-		w := seed(t, db)
+	db, err := ant.Open[MatrixDB](
+		t.Context(),
+		target.Dialect,
+		target.DSN,
+		ant.WithTracking(false),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-		t.Cleanup(func() { checkKnown(t) })
+	t.Cleanup(func() { db.Close() })
 
-		for _, src := range sources() {
-			for _, c := range conditions() {
-				for _, o := range orders() {
-					for _, p := range pagings() {
-						name := fmt.Sprintf("%s/%s/%s/%s", src.name, c.name, o.name, p.name)
-						t.Run(name, func(t *testing.T) { combination(t, db, w, src, c, o, p) })
-					}
+	w := seed(t, db)
+
+	t.Cleanup(func() { checkKnown(t) })
+
+	for _, src := range sources() {
+		for _, c := range conditions() {
+			for _, o := range orders() {
+				for _, p := range pagings() {
+					name := fmt.Sprintf("%s/%s/%s/%s", src.name, c.name, o.name, p.name)
+					t.Run(name, func(t *testing.T) { combination(t, db, w, src, c, o, p) })
 				}
 			}
 		}
-	})
+	}
 }
 
 func combination(t *testing.T, db *MatrixDB, w *world, src source, c condition, o order, p paging) {
@@ -387,13 +399,14 @@ func combination(t *testing.T, db *MatrixDB, w *world, src source, c condition, 
 }
 
 // refused runs a write that the database cannot take, which must say so with
-// ErrUnsupported, or ErrNoCondition first.
+// ErrUnsupported.
 func refused(t *testing.T, db *MatrixDB, write func(tx *MatrixDB) error) error {
 	var result error
 
 	err := db.Tx(t.Context(), func(tx *MatrixDB) error {
-		err := write(tx)
-		if !errors.Is(err, ant.ErrUnsupported) && !errors.Is(err, ant.ErrNoCondition) {
+		// The sources that need this filter themselves, so the guard has no
+		// part in it.
+		if err := write(tx); !errors.Is(err, ant.ErrUnsupported) {
 			result = fmt.Errorf("got %v, want ErrUnsupported", err)
 		}
 
