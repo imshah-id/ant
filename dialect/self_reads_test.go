@@ -2,9 +2,11 @@ package dialect_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/skudra-go/ant"
 	"github.com/skudra-go/ant/dialect"
 	"github.com/skudra-go/ant/dialect/mysql"
 	"github.com/skudra-go/ant/dialect/postgres"
@@ -210,7 +212,7 @@ func TestSelfReadsAreWrappedOnMySQL(t *testing.T) {
 				"`posts`.`user_id` = `users`.`id`) AS materialized)",
 		},
 		{
-			"a star with DISTINCT counts rows by its columns, so it stays",
+			"DISTINCT does not change whether a row exists",
 			&qb.Delete{
 				Table: users,
 				Where: []qb.Cond{qb.Exists{
@@ -221,7 +223,38 @@ func TestSelfReadsAreWrappedOnMySQL(t *testing.T) {
 					},
 				}},
 			},
-			"DELETE FROM `users` WHERE EXISTS (" + wrap + "SELECT DISTINCT * FROM `users`) AS materialized)",
+			"DELETE FROM `users` WHERE EXISTS (" + wrap + "SELECT DISTINCT 1 FROM `users`) AS materialized)",
+		},
+		{
+			"a star that ordering reads stays, on one table",
+			&qb.Delete{
+				Table: users,
+				Where: []qb.Cond{qb.Exists{
+					Select: &qb.Select{
+						Columns: []qb.Selected{{Value: qb.Star{}}},
+						From:    qb.Source{Table: users},
+						Order:   []qb.Order{{Value: age}},
+						Limit:   new(1),
+					},
+				}},
+			},
+			"DELETE FROM `users` WHERE EXISTS (" + wrap +
+				"SELECT * FROM `users` ORDER BY `users`.`age` LIMIT ?) AS materialized)",
+		},
+		{
+			"a generated name skips one the query has",
+			update(qb.In{
+				Left: id,
+				Sub: &qb.Select{
+					Columns: []qb.Selected{
+						{Value: qb.Func{Name: "MAX", Args: []qb.Expr{id}}},
+						{Value: qb.Column{Table: users, Name: "ant_c1"}},
+					},
+					From: qb.Source{Table: users},
+				},
+			}),
+			"UPDATE `users` SET `age` = ? WHERE `users`.`id` IN (" + wrap +
+				"SELECT MAX(`users`.`id`) AS `ant_c2`, `users`.`ant_c1` FROM `users`) AS materialized)",
 		},
 		{
 			"a SELECT reads freely",
@@ -300,5 +333,40 @@ func TestSelfReadBuildsLazyOnce(t *testing.T) {
 
 	if !strings.Contains(text, "materialized") || len(args) != 2 || args[1] != 1 {
 		t.Errorf("rendered %s with %v", text, args)
+	}
+}
+
+// A star over a join that cannot become SELECT 1 may name a column twice, which
+// a derived table refuses, so the write says so before reaching MySQL.
+func TestSelfReadStarOverJoinIsRefused(t *testing.T) {
+	users := &qb.TableRef{Name: "users"}
+	posts := &qb.TableRef{Name: "posts"}
+	id := qb.Column{Table: users, Name: "id"}
+
+	_, _, err := mysql.Dialect.Render(&qb.Delete{
+		Table: users,
+		Where: []qb.Cond{qb.Exists{
+			Select: &qb.Select{
+				Columns: []qb.Selected{{Value: qb.Star{}}},
+				From:    qb.Source{Table: users},
+				Joins: []qb.Join{
+					{
+						Source: qb.Source{Table: posts},
+						On: []qb.Cond{
+							qb.Compare{
+								Left:  qb.Column{Table: posts, Name: "user_id"},
+								Op:    qb.OpEq,
+								Right: id,
+							},
+						},
+					},
+				},
+				Order:  []qb.Order{{Value: id}},
+				Offset: new(1),
+			},
+		}},
+	})
+	if !errors.Is(err, ant.ErrUnsupported) {
+		t.Fatalf("got %v, want ErrUnsupported", err)
 	}
 }

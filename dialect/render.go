@@ -857,34 +857,58 @@ func (r *renderer) subquery(s *qb.Select, exists bool) {
 	r.args = r.args[:args]
 	r.replay = r.lazies
 
+	derived := derivable(s, exists)
+	if derived == nil && r.err == nil {
+		r.err = fmt.Errorf(
+			"%w: a SELECT * over a join or a set that reads the table being written, on %s",
+			errs.ErrUnsupported,
+			r.d.Name(),
+		)
+	}
+
+	if derived == nil {
+		derived = s
+	}
+
 	r.write("SELECT /*+ NO_MERGE(materialized) */ * FROM (")
-	r.selectStmt(derivable(s, exists))
+	r.selectStmt(derived)
 	r.write(") AS materialized")
 
 	r.inner, r.replay, r.lazies = false, nil, nil
 }
 
-// derivable returns s with columns a derived table takes. A column named like
-// another, or not named, as an expression is not, gets a name of its own, and
-// columns already named keep their names, which the query may refer to. The
-// columns of EXISTS matter to nothing, so a star there, which could name a
-// column twice, becomes 1, unless DISTINCT, a set, or an offset counts rows by
-// them.
+// derivable returns s with columns a derived table takes, or nil if it cannot
+// tell them. A column named like another, or not named, as an expression is not,
+// gets a name of its own, and columns already named keep their names, which the
+// query may refer to. The columns of EXISTS matter only to what reads them, so
+// SELECT * there, which could name a column twice, becomes SELECT 1 unless
+// grouping, ordering, an offset, or a set reads the columns. A star that stays,
+// over a join or a set, may hold two columns of one name, which a derived
+// table refuses, so that is nil.
 func derivable(s *qb.Select, exists bool) *qb.Select {
 	out := *s
 
-	star := slices.ContainsFunc(s.Columns, func(c qb.Selected) bool {
+	star := func(c qb.Selected) bool {
 		_, ok := c.Value.(qb.Star)
 
 		return ok
-	})
+	}
 
-	switch {
-	case star && exists && !s.Distinct && len(s.Sets) == 0 && s.Offset == nil:
-		out.Columns = []qb.Selected{{Value: qb.Fragment{SQL: "1"}}}
+	if slices.ContainsFunc(s.Columns, star) {
+		simple := exists && len(s.GroupBy) == 0 && len(s.Having) == 0 && len(s.Order) == 0 &&
+			s.Offset == nil && len(s.Sets) == 0 && !slices.ContainsFunc(s.Columns, func(c qb.Selected) bool {
+			return !star(c)
+		})
 
-		return &out
-	case star:
+		switch {
+		case simple:
+			out.Columns = []qb.Selected{{Value: qb.Fragment{SQL: "1"}}}
+
+			return &out
+		case len(s.Joins) > 0 || len(s.Sets) > 0:
+			return nil
+		}
+
 		return s
 	}
 
@@ -907,10 +931,22 @@ func derivable(s *qb.Select, exists bool) *qb.Select {
 	}
 
 	out.Columns = slices.Clone(s.Columns)
+	next := 0
 
 	for i, c := range out.Columns {
 		if name := natural(c); c.Alias == "" && (name == "" || seen[name] > 1) {
-			out.Columns[i].Alias = fmt.Sprintf("ant_c%d", i+1)
+			// A generated name must not be one the query has already.
+			for {
+				next++
+
+				alias := fmt.Sprintf("ant_c%d", next)
+				if seen[alias] == 0 {
+					seen[alias]++
+					out.Columns[i].Alias = alias
+
+					break
+				}
+			}
 		}
 	}
 
