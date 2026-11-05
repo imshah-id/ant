@@ -284,10 +284,19 @@ func (t *Table[T]) Reload(ctx context.Context, e *T) error {
 	}
 
 	entry := t.state.tracker.Get(unsafe.Pointer(e))
+
+	// The row is read into a value of its own and copied over, so that a
+	// Scanner that fills the map, slice, or pointee e holds leaves before as it
+	// was.
+	var read T
+	if err := readInto(rows, &read); err != nil {
+		return err
+	}
+
 	before := *e
 
-	if err := readInto(rows, e); err != nil {
-		return err
+	for _, f := range q.columns() {
+		f.Value(unsafe.Pointer(e)).Set(f.Value(unsafe.Pointer(&read)))
 	}
 
 	if entry != nil {

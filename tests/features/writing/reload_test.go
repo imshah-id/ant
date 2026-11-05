@@ -1,6 +1,12 @@
 package writing
 
 import (
+	"database/sql/driver"
+	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -50,5 +56,75 @@ func TestReload(t *testing.T) {
 		t.Run("a nil entity", func(t *testing.T) {
 			require.ErrorIs(t, db.Users.Reload(ctx, nil), ant.ErrNilEntity)
 		})
+	})
+}
+
+// Labels is a column whose Scan fills the map it already holds, as a Scanner
+// may.
+type Labels map[string]string
+
+func (l Labels) Value() (driver.Value, error) {
+	parts := make([]string, 0, len(l))
+
+	for _, k := range slices.Sorted(maps.Keys(l)) {
+		parts = append(parts, k+"="+l[k])
+	}
+
+	return strings.Join(parts, ","), nil
+}
+
+func (l *Labels) Scan(src any) error {
+	text, ok := src.(string)
+	if !ok {
+		return fmt.Errorf("labels: unexpected %T", src)
+	}
+
+	if *l == nil {
+		*l = Labels{}
+	}
+
+	clear(*l)
+
+	for part := range strings.SplitSeq(text, ",") {
+		if k, v, ok := strings.Cut(part, "="); ok {
+			(*l)[k] = v
+		}
+	}
+
+	return nil
+}
+
+type Box struct {
+	ID     int64
+	Labels Labels
+}
+
+type BoxDB struct {
+	ant.Context
+	Boxes ant.Table[Box]
+}
+
+var B = ant.Fields[Box]()
+
+// A rollback takes a reload back to the values it replaced, even a map that the
+// column's Scan fills in place.
+func TestReloadRollbackKeepsScannedMaps(t *testing.T) {
+	ddl := `CREATE TABLE boxes (id BIGSERIAL PRIMARY KEY, labels TEXT NOT NULL)`
+	fixture.RunTrackedWith(t, ddl, func(t *testing.T, db *BoxDB) {
+		ctx := t.Context()
+		box := &Box{Labels: Labels{"color": "red"}}
+		require.NoError(t, db.Boxes.Insert(ctx, box))
+
+		err := db.Tx(ctx, func(tx *BoxDB) error {
+			_, err := tx.Boxes.Where(ant.Eq(&B.ID, box.ID)).
+				Update(ctx, ant.Set(&B.Labels, Labels{"color": "blue"}))
+			require.NoError(t, err)
+			require.NoError(t, tx.Boxes.Reload(ctx, box))
+			require.Equal(t, Labels{"color": "blue"}, box.Labels)
+
+			return errors.New("roll back")
+		})
+		require.ErrorContains(t, err, "roll back")
+		require.Equal(t, Labels{"color": "red"}, box.Labels)
 	})
 }
