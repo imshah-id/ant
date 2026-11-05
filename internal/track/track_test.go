@@ -398,19 +398,28 @@ func TestUndoAfterALaterChange(t *testing.T) {
 		}
 	})
 
-	t.Run("a reload undoes with the values it replaced", func(t *testing.T) {
-		r := &row{ID: 4, Name: "before"}
+	t.Run("a reload undoes with the values it replaced, but not later edits", func(t *testing.T) {
+		r := &row{ID: 4, Name: "before", Bio: nil}
 		e := New().Track(m, unsafe.Pointer(r), Added)
-
 		saved := e.Saved(Unchanged)
-		reloaded := e.Reloaded(func() { r.Name = "before" })
+
+		before := *r
 		r.Name = "read"
+		reloaded := e.Reloaded(unsafe.Pointer(&before))
+
+		bio := "edited after the reload"
+		r.Bio = &bio
 
 		reloaded()
 		saved()
 
-		if e.State != Added || r.Name != "before" {
-			t.Fatalf("state %s, name %q, want Added and before", e.State, r.Name)
+		switch {
+		case e.State != Added:
+			t.Fatalf("state %s, want Added", e.State)
+		case r.Name != "before":
+			t.Fatalf("name %q, want the value the reload replaced", r.Name)
+		case r.Bio == nil || *r.Bio != bio:
+			t.Fatal("the rollback took back an edit made after the reload")
 		}
 	})
 }

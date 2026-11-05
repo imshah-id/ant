@@ -152,17 +152,22 @@ func (e *Entry) SetLinks(
 	return func() { e.Members, e.Parents = oldMembers, oldParents }
 }
 
-// Reloaded records an entry as read back from the database, and returns how to
-// undo that: restore puts back the values the read replaced, and the undo the
-// state and snapshot, so that a rollback takes the read back with the rows it
-// read.
-func (e *Entry) Reloaded(restore func()) (undo func()) {
+// Reloaded records an entry as read back from the database over before, a copy
+// of the entity as it was, and returns how to undo that, so that a rollback
+// takes the read back with the rows it read: the state and snapshot, and each
+// stored value the read replaced, unless it was changed since, which stands.
+func (e *Entry) Reloaded(before unsafe.Pointer) (undo func()) {
 	oldState, oldSnapshot := e.State, e.snapshot
 	e.State = Unchanged
 	e.Refresh()
+	read := e.snapshot
 
 	return e.undoSave(func() {
-		restore()
+		for _, f := range e.Model.Stored() {
+			if equal(f, e.Entity, read) {
+				f.Value(e.Entity).Set(f.Value(before))
+			}
+		}
 
 		e.State, e.snapshot = oldState, oldSnapshot
 	})

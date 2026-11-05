@@ -499,6 +499,22 @@ func TestConcurrentUse(t *testing.T) {
 			require.Equal(t, 1, stored(t, db, kim.ID).Age)
 		})
 
+		t.Run("an edit made after a reload outlives the rollback", func(t *testing.T) {
+			max := &User{Name: "Max", Email: "max.reload@example.com", Age: 1}
+			require.NoError(t, db.Users.Insert(ctx, max))
+
+			err := db.Tx(ctx, func(tx *AppDB) error {
+				require.NoError(t, tx.Users.Reload(ctx, max))
+
+				max.Name = "Maxine"
+
+				return errors.New("roll back")
+			})
+			require.ErrorContains(t, err, "roll back")
+			require.Equal(t, "Maxine", max.Name)
+			require.Equal(t, ant.Modified, ant.Entry(db, max).State(), "and is still to be saved")
+		})
+
 		t.Run(
 			"a relation load between a save and its rollback keeps a removal pending",
 			func(t *testing.T) {
