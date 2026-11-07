@@ -85,6 +85,7 @@ func TestInspection(t *testing.T) {
 		require.Contains(t, plan, "Limit")
 
 		x := 1
+		//antvet:ignore not a probe, on purpose: the test checks the error
 		_, _, err = db.Users.Where(ant.Gt(&x, 0)).ToSQL()
 		require.ErrorIs(t, err, ant.ErrNotProbe)
 	})

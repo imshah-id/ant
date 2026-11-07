@@ -1,11 +1,12 @@
 package dialect
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/skudra-go/ant/internal/errs"
 	"github.com/skudra-go/ant/qb"
@@ -48,12 +49,53 @@ type renderer struct {
 	d    Dialect
 	s    *Syntax
 	ctx  context.Context
-	sql  strings.Builder
+	sql  bytes.Buffer
 	args []any
 	err  error
 
 	top          *qb.Select // the statement itself, when it is a SELECT
 	duplicateKey bool       // inside ON DUPLICATE KEY UPDATE
+
+	// writing is the table an UPDATE or DELETE writes, with WrapSelfReads, while
+	// its values and conditions render. read records that a subquery among them
+	// reads it, maybe that it may, as raw SQL, a name a CTE may have, or a name
+	// in a schema only one side gives can, and inner that one is already being
+	// rendered.
+	writing *qb.TableRef
+	read    bool
+	maybe   bool
+	inner   bool
+
+	// lazies records what Lazy conditions built while a subquery was first
+	// written, and replay hands them out again when it is written a second time,
+	// so that each is built once.
+	lazies    []built
+	replay    []built
+	recording bool
+}
+
+// built is what one Lazy condition gave.
+type built struct {
+	cond qb.Cond
+	err  error
+}
+
+// build gives a Lazy condition's result, from a recording if there is one.
+func (r *renderer) build(c qb.Lazy) (qb.Cond, error) {
+	if len(r.replay) > 0 {
+		b := r.replay[0]
+		r.replay = r.replay[1:]
+
+		return b.cond, b.err
+	}
+
+	cond, err := c.Build(r.ctx)
+
+	if r.recording {
+		r.lazies = append(r.lazies, built{cond, err})
+	}
+
+	return cond, err
 }
 
 func (r *renderer) fail(kind string, node any) {
@@ -74,15 +116,39 @@ func (r *renderer) write(s string) { r.sql.WriteString(s) }
 func (r *renderer) quote(ident string) { r.write(r.d.Quote(ident)) }
 
 func (r *renderer) bind(v any) {
-	if t, ok := v.(time.Time); ok && r.s.UTCTimes {
-		v = t.UTC()
+	if r.s.UTCTimes {
+		v = utc(v)
 	}
 
 	r.args = append(r.args, v)
 	r.write(r.d.Placeholder(len(r.args)))
 }
 
+// derived runs after a derived table is written, with read saying whether a
+// sure read of the written table came before it. A sure read found inside it
+// counts only as one that may need the wrapper: MySQL 8.0 and 8.4 materialize
+// such a derived table before the write, though the manual says the optimizer
+// may merge one into the outer query. So the subquery is still wrapped where it
+// can be, but not refused where it cannot.
+func (r *renderer) derived(read bool) {
+	if r.read && !read {
+		r.read, r.maybe = false, true
+	}
+}
+
 func (r *renderer) table(t *qb.TableRef) {
+	if w := r.writing; w != nil && strings.EqualFold(t.Name, w.Name) {
+		switch {
+		case t.Name == w.Name && t.Schema == w.Schema:
+			r.read = true
+		case strings.EqualFold(t.Schema, w.Schema), t.Schema == "" || w.Schema == "":
+			// The same table only if names that differ in case are folded, as
+			// MySQL's lower_case_table_names decides, and if the one with no
+			// schema is in the other's, neither of which the renderer can tell.
+			r.maybe = true
+		}
+	}
+
 	if t.Schema != "" {
 		r.quote(t.Schema)
 		r.write(".")
@@ -140,7 +206,7 @@ func (r *renderer) expr(e qb.Expr) {
 		r.write(")")
 	case qb.Subquery:
 		r.write("(")
-		r.selectStmt(e.Select)
+		r.subquery(e.Select, false)
 		r.write(")")
 	case qb.Case:
 		r.write("CASE")
@@ -254,6 +320,11 @@ func (r *renderer) fragment(f qb.Fragment) {
 		r.need(Feature(f.Needs))
 	}
 
+	// Raw SQL cannot be read, so naming the table counts as maybe reading it.
+	if r.writing != nil && namesTable(f.SQL, r.writing.Name) {
+		r.maybe = true
+	}
+
 	args := f.Args
 
 	for i := 0; i < len(f.SQL); {
@@ -279,6 +350,142 @@ func (r *renderer) fragment(f qb.Fragment) {
 	}
 }
 
+// namesTable reports whether raw SQL names table, in any case, as MySQL reads
+// it: as a whole word, or quoted in backticks, whatever schema qualifies it,
+// since telling a schema from whatever else comes before a dot would take
+// parsing the SQL. A name inside a string literal or a comment does not count. How MySQL splits SQL into literals depends on the
+// SQL mode, which the renderer does not know: a backslash escapes a quote unless
+// NO_BACKSLASH_ESCAPES is set, and ANSI_QUOTES makes double quotes a name rather
+// than a string. So the SQL is read in every mode, and a name found in any of
+// them counts. Wrapping a subquery that did not need it costs a derived table,
+// and missing one fails the write with error 1093.
+func namesTable(q, table string) bool {
+	for _, backslash := range []bool{true, false} {
+		for _, ansiQuotes := range []bool{true, false} {
+			if namesTableIn(q, table, backslash, ansiQuotes) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// namesTableIn is namesTable in one SQL mode. Its comments are MySQL's: # and
+// -- to the end of the line, where -- needs a space or a control character
+// after it, and /* */, except that /*! */ holds SQL that MySQL runs, so that is
+// read on, past the version it may start with.
+func namesTableIn(q, table string, backslash, ansiQuotes bool) bool {
+	word := func(c byte) bool {
+		return isNameByte(c, false) || c == '$' || c >= 0x80
+	}
+
+	lineEnd := func(i int) int {
+		if end := strings.IndexByte(q[i:], '\n'); end >= 0 {
+			return i + end
+		}
+
+		return len(q)
+	}
+
+	for i := 0; i < len(q); {
+		c := q[i]
+		rest := q[i:]
+
+		switch {
+		case c == '`' || (c == '"' && ansiQuotes):
+			name, end := mysqlQuoted(q, i, false)
+			if strings.EqualFold(name, table) {
+				return true
+			}
+
+			i = end
+		case c == '\'' || c == '"':
+			_, i = mysqlQuoted(q, i, backslash)
+		case c == '#':
+			i = lineEnd(i)
+		case strings.HasPrefix(rest, "--") && (len(rest) == 2 || rest[2] <= ' '):
+			i = lineEnd(i)
+		case strings.HasPrefix(rest, "/*!"):
+			i += len("/*!")
+
+			// A version may come first, of five digits, which MySQL 8.4 reads,
+			// or six, as a later version may, and the SQL may follow it with no
+			// space between. Both are read, as either may be the server's.
+			digits := 0
+			for i+digits < len(q) && '0' <= q[i+digits] && q[i+digits] <= '9' {
+				digits++
+			}
+
+			for _, version := range []int{5, 6} {
+				j := i + version
+				if version > digits || j == len(q) || !word(q[j]) {
+					continue
+				}
+
+				end := j
+				for end < len(q) && word(q[end]) {
+					end++
+				}
+
+				if strings.EqualFold(q[j:end], table) {
+					return true
+				}
+			}
+
+			if digits >= 5 {
+				i += 5
+			}
+		case strings.HasPrefix(rest, "/*"):
+			if end := strings.Index(rest[2:], "*/"); end >= 0 {
+				i += 2 + end + 2
+			} else {
+				i = len(q)
+			}
+		case word(c):
+			j := i + 1
+
+			for j < len(q) && word(q[j]) {
+				j++
+			}
+
+			if strings.EqualFold(q[i:j], table) {
+				return true
+			}
+
+			i = j
+		default:
+			i++
+		}
+	}
+
+	return false
+}
+
+// mysqlQuoted reads the quoted text that starts at q[i], and returns it and the
+// index after its closing quote. A doubled quote stands for one, and with
+// backslash, a backslash takes the character after it as it is.
+func mysqlQuoted(q string, i int, backslash bool) (string, int) {
+	quote := q[i]
+
+	var text strings.Builder
+
+	for j := i + 1; j < len(q); j++ {
+		switch {
+		case backslash && q[j] == '\\' && j+1 < len(q):
+			j++
+		case q[j] == quote && j+1 < len(q) && q[j+1] == quote:
+			j++
+		case q[j] == quote:
+			return text.String(), j + 1
+		}
+
+		text.WriteByte(q[j])
+	}
+
+	return text.String(), len(q)
+}
+
 func (r *renderer) selected(s qb.Selected) {
 	r.expr(s.Value)
 
@@ -291,10 +498,18 @@ func (r *renderer) selected(s qb.Selected) {
 func (r *renderer) source(s qb.Source) {
 	switch {
 	case s.Sub != nil:
+		read := r.read
+
 		r.write("(")
 		r.selectStmt(s.Sub)
 		r.write(")")
+		r.derived(read)
 	case s.Name != "":
+		// A name may be the written table itself, or a CTE, which may read it.
+		if r.writing != nil && strings.EqualFold(s.Name, r.writing.Name) {
+			r.maybe = true
+		}
+
 		r.quote(s.Name)
 	case s.Raw != nil:
 		r.write("(")
@@ -730,9 +945,13 @@ func (r *renderer) update(s *qb.Update) {
 	r.write("UPDATE ")
 	r.table(s.Table)
 	r.write(" SET ")
-	r.assignments(s.Set)
-	r.output(s.Returning, "INSERTED")
-	r.where(s.Where)
+
+	r.writes(s.Table, func() {
+		r.assignments(s.Set)
+		r.output(s.Returning, "INSERTED")
+		r.where(s.Where)
+	})
+
 	r.returning(s.Returning)
 }
 
@@ -743,9 +962,163 @@ func (r *renderer) delete(s *qb.Delete) {
 
 	r.write("DELETE FROM ")
 	r.table(s.Table)
-	r.output(s.Returning, "DELETED")
-	r.where(s.Where)
+
+	r.writes(s.Table, func() {
+		r.output(s.Returning, "DELETED")
+		r.where(s.Where)
+	})
+
 	r.returning(s.Returning)
+}
+
+// writes renders the values and conditions of a write on table, watching its
+// subqueries for reads of table if the database needs them wrapped.
+func (r *renderer) writes(table *qb.TableRef, body func()) {
+	if r.s.WrapSelfReads {
+		r.writing = table
+
+		defer func() { r.writing = nil }()
+	}
+
+	body()
+}
+
+// subquery writes the SELECT of IN, EXISTS, or a scalar subquery. MySQL refuses
+// an UPDATE or DELETE whose subquery reads the table being written, at any
+// depth, but reads a derived table, which it materializes before writing. So
+// there such a subquery is wrapped in one, and NO_MERGE keeps the optimizer from
+// folding it back in.
+func (r *renderer) subquery(s *qb.Select, exists bool) {
+	if r.writing == nil || r.inner {
+		r.selectStmt(s)
+
+		return
+	}
+
+	start, args := r.sql.Len(), len(r.args)
+	r.read, r.maybe, r.inner = false, false, true
+	r.recording, r.lazies = true, nil
+
+	r.selectStmt(s)
+
+	r.recording = false
+
+	derived, columns := derivable(s, exists)
+
+	switch {
+	case !r.read && !r.maybe:
+		r.inner, r.lazies = false, nil
+
+		return
+	case derived == nil && r.read:
+		if r.err == nil {
+			r.err = fmt.Errorf(
+				"%w: a SELECT * beside other columns, or over a join or a set, that reads the table being written, on %s",
+				errs.ErrUnsupported,
+				r.d.Name(),
+			)
+		}
+
+		r.inner, r.lazies = false, nil
+
+		return
+	case derived == nil:
+		// A read the renderer is not sure of does not refuse a write that may
+		// not need the wrapper: the subquery stays as it was written, and if it
+		// reads the table, MySQL says so.
+		r.inner, r.lazies = false, nil
+
+		return
+	}
+
+	// Written again inside the wrapper, which names its columns itself, as IN,
+	// EXISTS, and a value read them by position.
+	r.sql.Truncate(start)
+	r.args = r.args[:args]
+	r.replay = r.lazies
+
+	r.write("SELECT /*+ NO_MERGE(materialized) */ * FROM (")
+	r.selectStmt(derived)
+	r.write(") AS materialized")
+
+	if columns > 0 {
+		r.write("(")
+
+		for i := range columns {
+			if i > 0 {
+				r.write(", ")
+			}
+
+			r.quote(fmt.Sprintf("ant_c%d", i+1))
+		}
+
+		r.write(")")
+	}
+
+	r.inner, r.replay, r.lazies = false, nil, nil
+}
+
+// derivable returns s as a derived table takes it, and how many columns the
+// derived table must name itself, or 0 if their own names do. A derived table
+// needs unique names, which MySQL makes up for a column with none, from its SQL.
+// One column is unique however it is named. Of several, two may share a name,
+// or have none the renderer can tell, as an expression or raw SQL has not, and
+// then the derived table's own column list, which MySQL takes from 8.0.19,
+// names them.
+// The subquery keeps its select list either way, so what refers to a column by
+// name, as ORDER BY and HAVING can, still finds the same one. A star cannot be
+// counted. In EXISTS its columns matter only to what reads them, so
+// SELECT * there becomes SELECT 1 unless grouping, ordering, an offset, or a set
+// reads the columns. A star over one table is left as it is, with the table's
+// names, which are unique. One beside other columns, or over a join or a set,
+// may name a column twice, which a derived table refuses, so that is nil.
+func derivable(s *qb.Select, exists bool) (*qb.Select, int) {
+	star := func(c qb.Selected) bool {
+		_, ok := c.Value.(qb.Star)
+
+		return ok
+	}
+
+	if !slices.ContainsFunc(s.Columns, star) {
+		if len(s.Columns) < 2 {
+			return s, 0
+		}
+
+		seen := map[string]bool{}
+
+		for _, c := range s.Columns {
+			name := strings.ToLower(c.Alias)
+
+			if column, ok := c.Value.(qb.Column); ok && name == "" {
+				name = strings.ToLower(column.Name)
+			}
+
+			if name == "" || seen[name] {
+				return s, len(s.Columns)
+			}
+
+			seen[name] = true
+		}
+
+		return s, 0
+	}
+
+	simple := exists && len(s.GroupBy) == 0 && len(s.Having) == 0 && len(s.Order) == 0 &&
+		s.Offset == nil && len(s.Sets) == 0 && !slices.ContainsFunc(s.Columns, func(c qb.Selected) bool {
+		return !star(c)
+	})
+
+	switch {
+	case simple:
+		out := *s
+		out.Columns = []qb.Selected{{Value: qb.Fragment{SQL: "1"}}}
+
+		return &out, 0
+	case len(s.Columns) > 1 || len(s.Joins) > 0 || len(s.Sets) > 0:
+		return nil, 0
+	}
+
+	return s, 0
 }
 
 func (r *renderer) merge(s *qb.Merge) {
@@ -866,14 +1239,14 @@ func (r *renderer) cond(c qb.Cond) {
 		}
 
 		r.write("EXISTS (")
-		r.selectStmt(c.Select)
+		r.subquery(c.Select, true)
 		r.write(")")
 	case qb.Fragment:
 		r.write("(")
 		r.fragment(c)
 		r.write(")")
 	case qb.Lazy:
-		built, err := c.Build(r.ctx)
+		built, err := r.build(c)
 
 		switch {
 		case err != nil:
@@ -935,11 +1308,17 @@ func (r *renderer) in(c qb.In) {
 	case c.Sub == nil:
 		list(r, c.Values, r.expr)
 	case c.Sub.Limit != nil && r.s.WrapLimitedIn:
+		inner, read := r.inner, r.read
+		r.inner = true
+
 		r.write("SELECT * FROM (")
 		r.selectStmt(c.Sub)
 		r.write(") AS limited")
+
+		r.inner = inner
+		r.derived(read)
 	default:
-		r.selectStmt(c.Sub)
+		r.subquery(c.Sub, false)
 	}
 
 	r.write(")")

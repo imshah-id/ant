@@ -51,6 +51,7 @@ func TestLogic(t *testing.T) {
 
 		t.Run("an error inside a group is reported", func(t *testing.T) {
 			age := 1
+			//antvet:ignore not a probe, on purpose: the test checks the error
 			_, err := db.Users.Where(ant.Not(ant.Or(ant.Gt(&age, 0)))).All(ctx)
 			require.ErrorIs(t, err, ant.ErrNotProbe)
 		})

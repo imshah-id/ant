@@ -101,4 +101,22 @@ go install github.com/skudra-go/ant/tools/antvet/cmd/antvet@latest
 go vet -vettool=$(which antvet) ./...
 ```
 
-It reports field pointers that are not probes, probes of the wrong model, and `Find` keys of the wrong type.
+It reports field pointers that are not probes; fields of a model a query does not read, in its conditions, ordering, grouping, columns, includes, and updates, and in aggregates such as `ant.SumOf`; and `Find` keys of the wrong type, including a key that `Configure` sets with `Key` or `GenerateKey`. A subquery's conditions may name its outer query's model, so a query is judged only where it runs, as in `.All(ctx)` or `ant.SumOf(ctx, q, ...)`, or inside the query it belongs to. Code that is wrong on purpose, such as a test of the error, says so at the end of its line, or on a line of its own above it:
+
+```go
+_, err := db.Users.Find(ctx, "1") //antvet:ignore the test checks ErrKeyType
+```
+
+## The test matrix
+
+`tests/matrix` checks ant itself by combination rather than one feature at a time. Each case is a point in a grid of source (`Query`, `From`, `FromCTE`, `Union`, `Intersect`, `Except`, a union of paged sides) × condition (every comparison, NULL handling, empty lists, `Like`, relations, subqueries, `And`/`Or`/`Not`) × ordering × paging, run through `All`, `First`, `Count`, `Exists`, `Include`, and bulk `Update` and `Delete`. An oracle works out each case in Go on the same seeded rows, with SQL's three-valued logic, and writes run in a transaction that rolls back, so the test can see which rows they changed.
+
+```sh
+ANT_TEST_DATABASES=postgres go test ./tests/matrix                  # one database
+ANT_TEST_DATABASES=postgres,mysql,mariadb,sqlite,sqlserver go test ./tests/matrix
+go test ./tests/matrix -run SQLSnapshots -update                    # after a deliberate SQL change
+```
+
+`TestSQLSnapshots` needs no database: it records the SQL of each combination for every dialect in `tests/matrix/testdata`, so a change to generated SQL shows up as a diff. A combination that fails for a tracked reason is listed in `known` in `matrix_test.go`, with its issue and the error that issue gives, and skips until the fix lands, while any other failure of it, such as rows the oracle does not expect, fails as usual. An entry none of whose combinations fails as it says fails the run, so the list cannot go stale. To cover something new, add a point to a dimension in `dims_test.go`, with what it means in Go beside it.
+
+`go test ./dialect -fuzz FuzzCommentsStayComments` and `-fuzz FuzzQuotingRoundTrips` search for comments and identifiers that escape their quoting.

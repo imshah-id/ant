@@ -133,6 +133,7 @@ func TestJoin(t *testing.T) {
 
 			o := ant.Fields[other]()
 			_, err := db.Posts.Join(&P.User).
+				//antvet:ignore another model's field, on purpose: the test checks the error
 				Where(ant.Eq(&o.ID, int64(1))).
 				Select(toByline).
 				All(ctx)
@@ -220,6 +221,7 @@ func TestJoinOn(t *testing.T) {
 
 		t.Run("a bad condition is reported", func(t *testing.T) {
 			x := int64(1)
+			//antvet:ignore not a probe, on purpose: the test checks the error
 			_, err := db.Users.JoinOn[Post](ant.EqCol(&U.ID, &x)).Select(pair).All(ctx)
 			require.ErrorIs(t, err, ant.ErrNotProbe)
 		})

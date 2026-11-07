@@ -65,6 +65,10 @@ type Syntax struct {
 	// WrapLimitedIn puts a derived table around a subquery with a LIMIT inside
 	// IN, for a database that refuses it directly.
 	WrapLimitedIn bool
+	// WrapSelfReads puts a derived table around a subquery of an UPDATE or DELETE
+	// that reads the table being written, for a database that refuses such a read
+	// but reads a derived table, which it materializes first.
+	WrapSelfReads bool
 	// HintInSelect moves an optimizer hint to just after SELECT.
 	HintInSelect bool
 	// MergeSemicolon ends MERGE with the semicolon the database demands.

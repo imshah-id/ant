@@ -112,6 +112,7 @@ func TestGroupBy(t *testing.T) {
 		t.Run("a bad Having is reported", func(t *testing.T) {
 			x := 1
 			_, err := ant.Project[bucket](
+				//antvet:ignore not a probe, on purpose: the test checks the error
 				db.Users.GroupBy(&U.Age).Having(ant.Gt(&x, 0)),
 				ant.Into(&B.Age, &U.Age),
 			).All(ctx)

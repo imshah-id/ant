@@ -103,8 +103,10 @@ func TestAggregates(t *testing.T) {
 
 		t.Run("errors reach the terminal call", func(t *testing.T) {
 			x := 1
+			//antvet:ignore not a probe, on purpose: the test checks the error
 			_, err := db.Users.Where(ant.Gt(&x, 0)).Count(ctx)
 			require.ErrorIs(t, err, ant.ErrNotProbe)
+			//antvet:ignore another model's field, on purpose: the test checks the error
 			_, err = ant.SumOf(ctx, db.Users.Where(), &P.ID)
 			require.ErrorIs(t, err, ant.ErrWrongModel)
 		})

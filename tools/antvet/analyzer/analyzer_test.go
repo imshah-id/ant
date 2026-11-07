@@ -9,5 +9,5 @@ import (
 )
 
 func Test(t *testing.T) {
-	analysistest.Run(t, analysistest.TestData(), analyzer.Analyzer, "example")
+	analysistest.Run(t, analysistest.TestData(), analyzer.Analyzer, "models", "example", "dotted")
 }

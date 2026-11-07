@@ -81,6 +81,7 @@ func TestUpsert(t *testing.T) {
 
 		t.Run("mistakes", func(t *testing.T) {
 			x := 1
+			//antvet:ignore not a probe, on purpose: the test checks the error
 			_, err := db.Users.Upsert(ctx, &fixture.User{}, ant.OnConflict(&x))
 			require.ErrorIs(t, err, ant.ErrNotProbe)
 			_, err = db.Users.Upsert(ctx, nil, onEmail)

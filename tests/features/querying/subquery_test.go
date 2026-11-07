@@ -63,6 +63,7 @@ func TestSubqueries(t *testing.T) {
 
 		t.Run("a bad subquery is reported", func(t *testing.T) {
 			x := 1
+			//antvet:ignore not a probe, on purpose: the test checks the error
 			bad := ant.SubOf(db.Posts.Where(ant.Gt(&x, 0)), &P.UserID)
 			_, err := db.Users.Where(ant.InSub(&U.ID, bad)).All(ctx)
 			require.ErrorIs(t, err, ant.ErrNotProbe)

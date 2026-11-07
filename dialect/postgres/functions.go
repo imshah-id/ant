@@ -109,9 +109,30 @@ func (p *Point) Scan(src any) error {
 		return fmt.Errorf("postgres: cannot scan %T into a point", src)
 	}
 
-	_, err := fmt.Sscanf(text, "(%g,%g)", &p.X, &p.Y)
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) < 5 || trimmed[0] != '(' || trimmed[len(trimmed)-1] != ')' {
+		return fmt.Errorf("postgres: cannot scan %q into a point", text)
+	}
 
-	return err
+	parts := strings.Split(trimmed[1:len(trimmed)-1], ",")
+	if len(parts) != 2 {
+		return fmt.Errorf("postgres: cannot scan %q into a point", text)
+	}
+
+	x, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	if err != nil {
+		return fmt.Errorf("postgres: cannot scan %q into a point: %w", text, err)
+	}
+
+	y, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil {
+		return fmt.Errorf("postgres: cannot scan %q into a point: %w", text, err)
+	}
+
+	p.X = x
+	p.Y = y
+
+	return nil
 }
 
 // Distance returns how far a point column is from p, in the column's units.

@@ -20,8 +20,13 @@ fmt:
 		for module in $(MODULES); do (cd $$module && golangci-lint run --fix ./...) || exit 1; done; \
 	done
 
+# ANTVET is where lint builds the analyzer, out of the source tree.
+ANTVET := $(shell go env GOCACHE)/antvet-lint
+
 lint:
 	go vet ./...
+	go build -C tools/antvet -o $(ANTVET) ./cmd/antvet
+	go vet -vettool=$(ANTVET) ./...
 	staticcheck ./...
 	go run -C tools/antfmt . -l $(CURDIR)
 	@for module in $(MODULES); do (cd $$module && golangci-lint run ./...) || exit 1; done

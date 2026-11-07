@@ -55,6 +55,7 @@ func TestHas(t *testing.T) {
 
 		t.Run("an error in a nested condition is reported", func(t *testing.T) {
 			x := 1
+			//antvet:ignore not a probe, on purpose: the test checks the error
 			_, err := db.Users.Where(ant.Has(&U.Posts, ant.Gt(&x, 0))).All(ctx)
 			require.ErrorIs(t, err, ant.ErrNotProbe)
 		})

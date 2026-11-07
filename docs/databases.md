@@ -51,13 +51,15 @@ Error helpers mean the same everywhere. `ant.IsUniqueViolation` works on all fiv
 
 **`ON DUPLICATE KEY` on MySQL and MariaDB.** It has no target: any unique key triggers it, not only the columns you name. If a different key is the one that collides, `Upsert` cannot find the row by your columns, and reports that it wrote nothing. Name the only unique key that can collide. It also takes no `WHERE`, so `Conflict.Where` is an error, and an `Upsert` of a copy that carries a version cannot check that version: the version moves on, but the copy's update goes ahead.
 
+**Writes that read their own table on MySQL.** MySQL refuses an `UPDATE` or `DELETE` whose subquery reads the table being written (error 1093), so ant wraps such a subquery in a derived table there, which MySQL reads first. A subquery with several columns that share a name, or that are expressions, takes MySQL 8.0.19 or later, for the derived table's column list, and a correlated one 8.0.14. An upsert's `Set` cannot read its own table on MySQL at all.
+
 **`OUTPUT` on SQL Server.** SQL Server refuses it on a table with triggers, so a model that needs a key back cannot be inserted into one.
 
 **Upserts on SQL Server.** There is no `ON CONFLICT`. Use `ant.Merge`.
 
 **Paging on SQL Server.** `OFFSET ... FETCH` needs an `ORDER BY`, so ant adds a meaningless one if the query has none. SQL Server refuses a `Limit` of zero.
 
-**Times.** SQLite stores times as text, and SQL Server's `DATETIME2` has no zone, so ant binds UTC on both to keep one clock. MySQL's driver does the same. `ant.Past` and `ant.Future` compare with the server's own clock, so run the server in UTC. On SQLite and MySQL, `CURRENT_TIMESTAMP` has whole seconds.
+**Times.** SQLite stores times as text, and SQL Server's `DATETIME2` has no zone, so ant binds UTC on both to keep one clock, whatever holds the time: `*time.Time`, `sql.NullTime`, an `sql.Null` of a time, a pointer to one, or an interface holding one, types built on them such as `ant.DeletedAt`, and arguments of raw queries, each element of an `IN` list included. A `driver.Valuer` of your own is passed as it is, so have it give a time in UTC. MySQL's driver does the same. `ant.Past` and `ant.Future` compare with the server's own clock, so run the server in UTC. On SQLite and MySQL, `CURRENT_TIMESTAMP` has whole seconds.
 
 **Parameters.** Limits differ: 65,535 on PostgreSQL and MySQL, 32,766 on SQLite, and about 2,100 on SQL Server, where ant stays at 2,000. `InsertMany`, `SaveChanges`, and `Include` split their work to fit. Your own `In` with a long list does not.
 

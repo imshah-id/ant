@@ -37,6 +37,7 @@ func TestFieldProbes(t *testing.T) {
 		// These compile, so ant reports them at the terminal call.
 		t.Run("a pointer that is not a probe is an error", func(t *testing.T) {
 			age := 18
+			//antvet:ignore not a probe, on purpose: the test checks the error
 			_, err := db.Users.Where(ant.Gt(&age, 18)).All(ctx)
 			require.ErrorIs(t, err, ant.ErrNotProbe)
 		})
@@ -44,11 +45,13 @@ func TestFieldProbes(t *testing.T) {
 		t.Run("a field of a normal value is not a probe", func(t *testing.T) {
 			var user fixture.User
 
+			//antvet:ignore not a probe, on purpose: the test checks the error
 			_, err := db.Users.Where(ant.Gt(&user.Age, 18)).All(ctx)
 			require.ErrorIs(t, err, ant.ErrNotProbe)
 		})
 
 		t.Run("a probe of another model is an error", func(t *testing.T) {
+			//antvet:ignore another model's probe, on purpose: the test checks the error
 			_, err := db.Posts.Where(ant.Gt(&U.Age, 18)).All(ctx)
 			require.ErrorIs(t, err, ant.ErrWrongModel)
 		})
@@ -60,6 +63,7 @@ func TestFieldProbes(t *testing.T) {
 
 		t.Run("errors from several conditions are all reported", func(t *testing.T) {
 			age := 18
+			//antvet:ignore not a probe, on purpose: the test checks the error
 			_, err := db.Posts.Where(ant.Gt(&age, 18), ant.Gt(&U.Age, 18)).All(ctx)
 			require.True(t, errors.Is(err, ant.ErrNotProbe) && errors.Is(err, ant.ErrWrongModel))
 		})

@@ -84,6 +84,7 @@ func TestShapedInclude(t *testing.T) {
 		t.Run("an error inside the function reaches the terminal call", func(t *testing.T) {
 			x := 1
 			_, err := db.Users.Include(&U.Posts, func(q *ant.Query[Post]) *ant.Query[Post] {
+				//antvet:ignore not a probe, on purpose: the test checks the error
 				return q.Where(ant.Gt(&x, 0))
 			}).All(ctx)
 			require.ErrorIs(t, err, ant.ErrNotProbe)

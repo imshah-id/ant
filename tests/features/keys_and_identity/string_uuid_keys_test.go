@@ -67,6 +67,7 @@ func TestStringAndUUIDKeys(t *testing.T) {
 		})
 
 		t.Run("a key of the wrong type", func(t *testing.T) {
+			//antvet:ignore a key of the wrong type, on purpose: the test checks the error
 			_, err := db.Pages.Find(ctx, 42)
 			require.ErrorIs(t, err, ant.ErrKeyType)
 		})

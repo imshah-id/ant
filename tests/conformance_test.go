@@ -14,6 +14,7 @@ import (
 	"github.com/skudra-go/ant"
 	"github.com/skudra-go/ant/dialect"
 	"github.com/skudra-go/ant/internal/testdb"
+	"github.com/skudra-go/ant/qb"
 )
 
 // These run on every database, and each covers something the dialects write
@@ -1042,5 +1043,497 @@ func TestConformanceUpsertVersion(t *testing.T) {
 		require.Equal(t, version(), stored[0].Version)
 		require.Greater(t, stored[0].Version, int64(1), "InsertMany moved it on too")
 		require.EqualValues(t, 1, stored[1].Version)
+	})
+}
+
+// Moment holds a time in every shape a model can, to see each bound the same way.
+type Moment struct {
+	ID        int64
+	At        time.Time
+	Maybe     *time.Time
+	Opt       sql.Null[time.Time]
+	Legacy    sql.NullTime
+	DeletedAt ant.DeletedAt
+}
+
+func (Moment) Configure(b *ant.ModelBuilder[Moment]) { b.Table("moments") }
+
+var Mo = ant.Fields[Moment]()
+
+type MomentDB struct {
+	ant.Context
+	Moments ant.Table[Moment]
+}
+
+// timestamps is the column type for a time on each database, as the fixture uses.
+var timestamps = map[string]string{
+	"postgres":  "TIMESTAMPTZ",
+	"mysql":     "DATETIME(6)",
+	"mariadb":   "DATETIME(6)",
+	"sqlite":    "TIMESTAMP",
+	"sqlserver": "DATETIME2",
+}
+
+// A time is one instant, whatever zone it was made in and whatever holds it: a
+// pointer, sql.Null, sql.NullTime, ant.DeletedAt, or an argument of a raw query.
+// SQL Server and SQLite keep no zone, so ant stores them all in UTC there.
+func TestConformanceTimeShapes(t *testing.T) {
+	testdb.ForEach(t, func(t *testing.T, target testdb.Target) {
+		ctx := t.Context()
+		ts := timestamps[target.Name]
+		_, err := target.DB.ExecContext(ctx, fmt.Sprintf(
+			`CREATE TABLE moments (
+			id BIGINT PRIMARY KEY,
+			at %[1]s NOT NULL,
+			maybe %[1]s NULL,
+			opt %[1]s NULL,
+			legacy %[1]s NULL,
+			deleted_at %[1]s NULL)`,
+			ts,
+		))
+		require.NoError(t, err)
+
+		t.Cleanup(func() {
+			_, _ = target.DB.ExecContext(context.Background(), "DROP TABLE moments")
+		})
+
+		db, err := ant.Open[MomentDB](ctx, target.Dialect, target.DSN, ant.WithTracking(false))
+		require.NoError(t, err)
+		t.Cleanup(func() { db.Close() })
+
+		east := time.FixedZone("UTC+3", 3*60*60)
+		at := time.Date(2026, 1, 2, 15, 4, 5, 0, east) // 12:04:05 UTC
+		later := at.Add(time.Hour)
+
+		full := &Moment{
+			ID:        1,
+			At:        at,
+			Maybe:     &at,
+			Opt:       sql.Null[time.Time]{V: at, Valid: true},
+			Legacy:    sql.NullTime{Time: at, Valid: true},
+			DeletedAt: ant.DeletedAt{Null: sql.Null[time.Time]{V: at, Valid: true}},
+		}
+
+		empty := &Moment{ID: 2, At: at}
+		require.NoError(t, db.Moments.Insert(ctx, full, empty))
+
+		read := func(id int64) *Moment {
+			t.Helper()
+
+			m, err := db.Moments.WithDeleted().Where(ant.Eq(&Mo.ID, id)).First(ctx)
+			require.NoError(t, err)
+
+			return m
+		}
+
+		t.Run("each shape reads back as the same instant", func(t *testing.T) {
+			m := read(1)
+			require.True(t, at.Equal(m.At), "time.Time: %v", m.At)
+			require.NotNil(t, m.Maybe)
+			require.True(t, at.Equal(*m.Maybe), "*time.Time: %v", *m.Maybe)
+			require.True(t, at.Equal(m.Opt.V), "sql.Null: %v", m.Opt.V)
+			require.True(t, at.Equal(m.Legacy.Time), "sql.NullTime: %v", m.Legacy.Time)
+			require.True(t, at.Equal(m.DeletedAt.V), "ant.DeletedAt: %v", m.DeletedAt.V)
+
+			m = read(2)
+			require.Nil(t, m.Maybe)
+			require.False(t, m.Opt.Valid)
+			require.False(t, m.Legacy.Valid)
+			require.False(t, m.DeletedAt.Valid)
+		})
+
+		t.Run("each shape finds its row", func(t *testing.T) {
+			conds := map[string]ant.Cond{
+				"time.Time":    ant.Eq(&Mo.At, at),
+				"*time.Time":   ant.Eq(&Mo.Maybe, &at),
+				"sql.Null":     ant.Eq(&Mo.Opt, sql.Null[time.Time]{V: at, Valid: true}),
+				"sql.NullTime": ant.Eq(&Mo.Legacy, sql.NullTime{Time: at, Valid: true}),
+				"ant.DeletedAt": ant.Eq(
+					&Mo.DeletedAt,
+					ant.DeletedAt{Null: sql.Null[time.Time]{V: at, Valid: true}},
+				),
+			}
+
+			for name, cond := range conds {
+				n, err := db.Moments.WithDeleted().
+					Where(cond).
+					Where(ant.Eq(&Mo.ID, int64(1))).
+					Count(ctx)
+				require.NoError(t, err, name)
+				require.EqualValues(t, 1, n, name)
+			}
+		})
+
+		t.Run("an update stores the same instant", func(t *testing.T) {
+			_, err := db.Moments.WithDeleted().Where(ant.Eq(&Mo.ID, int64(2))).Update(ctx,
+				ant.Set(&Mo.Maybe, &later),
+				ant.Set(&Mo.Opt, sql.Null[time.Time]{V: later, Valid: true}),
+				ant.Set(&Mo.Legacy, sql.NullTime{Time: later, Valid: true}))
+			require.NoError(t, err)
+
+			m := read(2)
+			require.True(t, later.Equal(*m.Maybe), "*time.Time: %v", *m.Maybe)
+			require.True(t, later.Equal(m.Opt.V), "sql.Null: %v", m.Opt.V)
+			require.True(t, later.Equal(m.Legacy.Time), "sql.NullTime: %v", m.Legacy.Time)
+		})
+
+		t.Run("a raw query's argument is the same instant", func(t *testing.T) {
+			n, err := ant.Raw[int64](db, "SELECT COUNT(*) FROM moments WHERE at = ?", at).First(ctx)
+			require.NoError(t, err)
+			require.EqualValues(t, 2, *n)
+
+			n, err = ant.Raw[int64](
+				db,
+				"SELECT COUNT(*) FROM moments WHERE maybe = @when",
+				sql.Named("when", &at),
+			).First(ctx)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, *n)
+		})
+
+		// database/sql reads an sql.Null of a pointer, or of an interface, as
+		// what it holds, so those are times too, stored raw or by an update ant
+		// renders, and read back past ant.
+		t.Run("an sql.Null that holds a time stores the same instant", func(t *testing.T) {
+			args := map[string]any{
+				"sql.Null[*time.Time]":  sql.Null[*time.Time]{V: &at, Valid: true},
+				"sql.Null[any]":         sql.Null[any]{V: at, Valid: true},
+				"sql.Null[any] pointer": sql.Null[any]{V: &at, Valid: true},
+				"sql.Null[sql.NullTime]": sql.Null[sql.NullTime]{
+					V:     sql.NullTime{Time: at, Valid: true},
+					Valid: true,
+				},
+			}
+
+			storedAt := func(t *testing.T) time.Time {
+				t.Helper()
+
+				var stored time.Time
+				require.NoError(t, target.DB.QueryRowContext(ctx,
+					"SELECT legacy FROM moments WHERE id = 2").Scan(&stored))
+
+				return stored
+			}
+
+			for name, arg := range args {
+				_, err := ant.Raw[int64](
+					db,
+					"UPDATE moments SET legacy = ? WHERE id = 2",
+					arg,
+				).Exec(ctx)
+				require.NoError(t, err, name)
+				require.True(t, at.Equal(storedAt(t)), "%s, raw: stored %v", name, storedAt(t))
+
+				_, err = ant.Raw[int64](
+					db,
+					"UPDATE moments SET legacy = NULL WHERE id = 2",
+				).Exec(ctx)
+				require.NoError(t, err)
+
+				_, err = db.Moments.WithDeleted().
+					Where(ant.Eq(&Mo.ID, int64(2))).
+					Update(ctx, ant.SetExpr(&Mo.Legacy, ant.SQL[sql.NullTime]("?", arg)))
+				require.NoError(t, err, name)
+				require.True(t, at.Equal(storedAt(t)), "%s, rendered: stored %v", name, storedAt(t))
+			}
+		})
+
+		t.Run("the stored clock is the same, past ant", func(t *testing.T) {
+			var stored time.Time
+			require.NoError(t, target.DB.QueryRowContext(ctx,
+				"SELECT maybe FROM moments WHERE id = 1").Scan(&stored))
+
+			require.True(t, at.Equal(stored), "stored %v", stored)
+		})
+	})
+}
+
+// A write whose subquery reads the table being written works everywhere. MySQL
+// refuses one (error 1093) unless the read is in a derived table it has
+// materialized, so ant wraps such subqueries there, at any depth.
+func TestConformanceWritesReadingTheirTable(t *testing.T) {
+	testdb.ForEach(t, func(t *testing.T, target testdb.Target) {
+		ctx := t.Context()
+
+		// fresh seeds alice 30, bob 25, carol 35, and a post by carol.
+		fresh := func(t *testing.T) *AppDB {
+			t.Helper()
+
+			app := openApp(t, target)
+			_, err := app.Posts.Unfiltered().Delete(ctx)
+			require.NoError(t, err)
+			_, err = app.Users.Unfiltered().Delete(ctx)
+			require.NoError(t, err)
+
+			users := seedUsers(t, app, "alice", 30, "bob", 25, "carol", 35)
+			require.NoError(t, app.Posts.Insert(ctx, &Post{UserID: users[2].ID, Title: "c"}))
+
+			return app
+		}
+
+		ages := func(t *testing.T, app *AppDB) map[string]int {
+			t.Helper()
+
+			users, err := app.Users.NoTracking().All(ctx)
+			require.NoError(t, err)
+
+			out := map[string]int{}
+
+			for _, u := range users {
+				out[u.Name] = u.Age
+			}
+
+			return out
+		}
+
+		older := func(app *AppDB) ant.Sub[int64] {
+			return ant.SubOf(app.Users.Where(ant.Gt(&U.Age, 28)), &U.ID)
+		}
+
+		t.Run("IN a subquery of the same table", func(t *testing.T) {
+			app := fresh(t)
+			n, err := app.Users.Where(ant.InSub(&U.ID, older(app))).Update(ctx, ant.Inc(&U.Age, 1))
+			require.NoError(t, err)
+			require.EqualValues(t, 2, n)
+			require.Equal(t, map[string]int{"alice": 31, "bob": 25, "carol": 36}, ages(t, app))
+		})
+
+		t.Run("NOT IN, in a delete", func(t *testing.T) {
+			app := fresh(t)
+			n, err := app.Users.Where(ant.NotInSub(&U.ID, older(app))).Delete(ctx)
+			require.NoError(t, err)
+			require.EqualValues(t, 1, n)
+			require.Equal(t, map[string]int{"alice": 30, "carol": 35}, ages(t, app))
+		})
+
+		t.Run("a value from the same table", func(t *testing.T) {
+			app := fresh(t)
+			oldest := ant.SubExpr(app.Users.Query(), ant.Max(&U.Age)).Expr()
+			n, err := app.Users.Where(ant.Eq(&U.Name, "bob")).
+				Update(ctx, ant.SetExpr(&U.Age, oldest))
+			require.NoError(t, err)
+			require.EqualValues(t, 1, n)
+			require.Equal(t, 35, ages(t, app)["bob"])
+		})
+
+		// The derived table names its columns, so a raw expression in the
+		// subquery's select list stays as it is.
+		t.Run("a raw value from the same table", func(t *testing.T) {
+			app := fresh(t)
+			oldest := ant.SubExpr(app.Users.Query(), ant.SQL[int]("MAX(age)")).Expr()
+			n, err := app.Users.Where(ant.Eq(&U.Name, "bob")).
+				Update(ctx, ant.SetExpr(&U.Age, oldest))
+			require.NoError(t, err)
+			require.EqualValues(t, 1, n)
+			require.Equal(t, 35, ages(t, app)["bob"])
+		})
+
+		t.Run("a read through another table's subquery", func(t *testing.T) {
+			app := fresh(t)
+			byOlder := app.Posts.Where(
+				ant.EqCol(&P.UserID, &U.ID),
+				ant.InSub(&P.UserID, older(app)),
+			)
+			n, err := app.Users.Where(ant.Exists(byOlder)).Update(ctx, ant.Inc(&U.Age, 1))
+			require.NoError(t, err)
+			require.EqualValues(t, 1, n, "carol, who is older and has a post")
+			require.Equal(t, 36, ages(t, app)["carol"])
+		})
+
+		t.Run("a derived source and a read of the table", func(t *testing.T) {
+			app := fresh(t)
+			n, err := app.Users.Query().
+				From(app.Users.Where(ant.Gt(&U.Age, 20))).
+				Where(ant.InSub(&U.ID, older(app))).
+				Update(ctx, ant.Inc(&U.Age, 1))
+			require.NoError(t, err)
+			require.EqualValues(t, 2, n)
+		})
+
+		t.Run("a limited write and a read of the table", func(t *testing.T) {
+			app := fresh(t)
+			n, err := app.Users.Where(ant.InSub(&U.ID, older(app))).
+				OrderBy(&U.Age).
+				Limit(1).
+				Update(ctx, ant.Inc(&U.Age, 1))
+			require.NoError(t, err)
+			require.EqualValues(t, 1, n)
+			require.Equal(t, 31, ages(t, app)["alice"])
+		})
+
+		// MySQL reads a backslash before a quote as an escape, so the literal
+		// goes on past it, and the read of users that follows must be found.
+		t.Run("raw SQL with an escaped quote before a read of the table", func(t *testing.T) {
+			if target.Name != "mysql" && target.Name != "mariadb" {
+				t.Skip("only MySQL and MariaDB read a backslash in a literal as an escape")
+			}
+
+			app := fresh(t)
+			byOlder := app.Posts.Where(ant.SQLCond(
+				`posts.title <> 'it\'s' AND posts.user_id IN (SELECT id FROM users WHERE age > 28)`,
+			))
+			n, err := app.Users.Where(ant.InSub(&U.ID, ant.SubOf(byOlder, &P.UserID))).
+				Update(ctx, ant.Inc(&U.Age, 1))
+			require.NoError(t, err)
+			require.EqualValues(t, 1, n, "carol, who is older and has a post")
+			require.Equal(t, 36, ages(t, app)["carol"])
+		})
+
+		// MySQL takes a derived table only with unique column names, so a
+		// subquery of several columns that share a name, or are expressions, is
+		// wrapped with a column list. Each runs, and changes the rows it says.
+		t.Run("subqueries of several columns", func(t *testing.T) {
+			if target.Name == "sqlserver" {
+				t.Skip("SQL Server has no row values to compare a subquery of several columns with")
+			}
+
+			users, posts := &qb.TableRef{Name: "users"}, &qb.TableRef{Name: "posts"}
+			id, age := qb.Column{Table: users, Name: "id"}, qb.Column{Table: users, Name: "age"}
+			older := qb.Compare{Left: age, Op: qb.OpGt, Right: qb.Param{Value: 28}}
+
+			cases := []struct {
+				name string
+				left []qb.Expr
+				sub  *qb.Select
+				want map[string]int
+			}{
+				{
+					"two columns given one name",
+					[]qb.Expr{id, id},
+					&qb.Select{
+						Columns: []qb.Selected{{Value: id, Alias: "x"}, {Value: id, Alias: "x"}},
+						From:    qb.Source{Table: users},
+						Where:   []qb.Cond{older},
+					},
+					map[string]int{"alice": 31, "bob": 25, "carol": 36},
+				},
+				{
+					"expressions",
+					[]qb.Expr{id, age},
+					&qb.Select{
+						Columns: []qb.Selected{
+							{Value: qb.Fragment{SQL: "users.id + 0"}},
+							{Value: qb.Fragment{SQL: "users.age + 0"}},
+						},
+						From:  qb.Source{Table: users},
+						Where: []qb.Cond{older},
+					},
+					map[string]int{"alice": 31, "bob": 25, "carol": 36},
+				},
+				{
+					"columns of one name from a join",
+					[]qb.Expr{id, id},
+					&qb.Select{
+						Columns: []qb.Selected{
+							{Value: id},
+							{Value: qb.Column{Table: posts, Name: "user_id"}, Alias: "id"},
+						},
+						From: qb.Source{Table: users},
+						Joins: []qb.Join{{
+							Source: qb.Source{Table: posts},
+							On: []qb.Cond{qb.Compare{
+								Left:  qb.Column{Table: posts, Name: "user_id"},
+								Op:    qb.OpEq,
+								Right: id,
+							}},
+						}},
+						Where: []qb.Cond{older},
+					},
+					map[string]int{"alice": 30, "bob": 25, "carol": 36},
+				},
+			}
+
+			for _, tt := range cases {
+				t.Run(tt.name, func(t *testing.T) {
+					app := fresh(t)
+
+					query, args, err := target.Dialect.Render(&qb.Update{
+						Table: users,
+						Set:   []qb.Assignment{{Column: "age", Value: qb.Fragment{SQL: "age + 1"}}},
+						Where: []qb.Cond{qb.In{Left: qb.Row{Values: tt.left}, Sub: tt.sub}},
+					})
+					require.NoError(t, err)
+
+					_, err = target.DB.ExecContext(ctx, query, args...)
+					require.NoError(t, err, query)
+					require.Equal(t, tt.want, ages(t, app), query)
+				})
+			}
+		})
+
+		// A star over a join that ordering and an offset read cannot be wrapped,
+		// and where its only read of the table is inside a derived table, which
+		// MySQL materializes, the write runs as it is.
+		t.Run("a star whose only read is in a derived table", func(t *testing.T) {
+			app := fresh(t)
+			users, posts := &qb.TableRef{Name: "users"}, &qb.TableRef{Name: "posts"}
+			userID := qb.Column{Table: posts, Name: "user_id"}
+
+			older := &qb.Select{
+				Columns: []qb.Selected{{Value: qb.Column{Table: users, Name: "id"}}},
+				From:    qb.Source{Table: users},
+				Where: []qb.Cond{qb.Compare{
+					Left:  qb.Column{Table: users, Name: "age"},
+					Op:    qb.OpGt,
+					Right: qb.Param{Value: 28},
+				}},
+			}
+
+			query, args, err := target.Dialect.Render(&qb.Delete{
+				Table: users,
+				Where: []qb.Cond{qb.Exists{
+					Select: &qb.Select{
+						Columns: []qb.Selected{{Value: qb.Star{}}},
+						From:    qb.Source{Table: posts},
+						Joins: []qb.Join{{
+							Source: qb.Source{Table: posts, Alias: "p2"},
+							On: []qb.Cond{qb.Compare{
+								Left:  qb.Column{Table: &qb.TableRef{Name: "p2"}, Name: "id"},
+								Op:    qb.OpEq,
+								Right: qb.Column{Table: posts, Name: "id"},
+							}},
+						}},
+						Where: []qb.Cond{
+							qb.Compare{
+								Left:  userID,
+								Op:    qb.OpEq,
+								Right: qb.Column{Table: users, Name: "id"},
+							},
+							qb.In{
+								Left: userID,
+								Sub: &qb.Select{
+									Columns: []qb.Selected{{Value: qb.Column{Name: "id"}}},
+									From:    qb.Source{Sub: older, Alias: "d"},
+								},
+							},
+						},
+						Order:  []qb.Order{{Value: qb.Column{Table: posts, Name: "id"}}},
+						Offset: new(0),
+					},
+				}},
+			})
+			require.NoError(t, err)
+
+			_, err = target.DB.ExecContext(ctx, query, args...)
+			require.NoError(t, err, query)
+
+			require.Equal(
+				t,
+				map[string]int{"alice": 30, "bob": 25},
+				ages(t, app),
+				"carol, older with a post",
+			)
+		})
+
+		t.Run("a correlated read of the same table", func(t *testing.T) {
+			app := fresh(t)
+			younger := ant.SubOf(app.Posts.Where(ant.EqCol(&P.UserID, &U.ID)), &P.UserID)
+			n, err := app.Users.Where(ant.NotInSub(&U.ID, younger)).
+				Where(ant.Lt(&U.Age, 31)).
+				Delete(ctx)
+			require.NoError(t, err)
+			require.EqualValues(t, 2, n, "alice and bob have no post")
+			require.Equal(t, map[string]int{"carol": 35}, ages(t, app))
+		})
 	})
 }

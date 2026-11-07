@@ -22,9 +22,17 @@ var (
 )
 
 var (
-	mysqlSyntax = shared(dialect.ReturningInsert, dialect.ReturningDelete)
+	mysqlSyntax = selfReads(shared(dialect.ReturningInsert, dialect.ReturningDelete))
 	mariaSyntax = shared(dialect.ShareLocks, dialect.LateralJoin)
 )
+
+// selfReads marks MySQL, which refuses a write whose subquery reads the table
+// being written (error 1093). MariaDB allows it.
+func selfReads(s dialect.Syntax) dialect.Syntax {
+	s.WrapSelfReads = true
+
+	return s
+}
 
 func shared(missing ...dialect.Feature) dialect.Syntax {
 	return dialect.Syntax{

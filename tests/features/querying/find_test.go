@@ -34,6 +34,7 @@ func TestFind(t *testing.T) {
 
 		// The compiler cannot tie the key type to the model, so ant checks it.
 		t.Run("a key of the wrong type", func(t *testing.T) {
+			//antvet:ignore a key of the wrong type, on purpose: the test checks the error
 			_, err := db.Users.Find(ctx, "1")
 			require.ErrorIs(t, err, ant.ErrKeyType)
 		})

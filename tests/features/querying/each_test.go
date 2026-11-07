@@ -51,6 +51,7 @@ func TestEach(t *testing.T) {
 			age := 1
 			count := 0
 
+			//antvet:ignore not a probe, on purpose: the test checks the error
 			for _, err := range db.Users.Where(ant.Gt(&age, 0)).Each(ctx) {
 				require.ErrorIs(t, err, ant.ErrNotProbe)
 

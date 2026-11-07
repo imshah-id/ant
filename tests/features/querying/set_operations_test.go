@@ -75,6 +75,7 @@ func TestSetOperations(t *testing.T) {
 
 		t.Run("an error in either side is reported", func(t *testing.T) {
 			x := 1
+			//antvet:ignore not a probe, on purpose: the test checks the error
 			_, err := young.Union(db.Users.Where(ant.Gt(&x, 0))).All(ctx)
 			require.ErrorIs(t, err, ant.ErrNotProbe)
 		})

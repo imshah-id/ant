@@ -59,12 +59,14 @@ func TestUpdate(t *testing.T) {
 		})
 
 		t.Run("a field of another model", func(t *testing.T) {
+			//antvet:ignore another model's field, on purpose: the test checks the error
 			_, err := db.Users.Where(ant.Eq(&U.ID, alice.ID)).Update(ctx, ant.Set(&P.Title, "x"))
 			require.ErrorIs(t, err, ant.ErrWrongModel)
 		})
 
 		t.Run("a pointer that is not a probe", func(t *testing.T) {
 			age := 1
+			//antvet:ignore not a probe, on purpose: the test checks the error
 			_, err := db.Users.Where(ant.Eq(&U.ID, alice.ID)).Update(ctx, ant.Set(&age, 2))
 			require.ErrorIs(t, err, ant.ErrNotProbe)
 		})

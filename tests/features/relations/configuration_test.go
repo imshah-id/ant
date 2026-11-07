@@ -108,6 +108,7 @@ func TestConfiguredRelations(t *testing.T) {
 		t.Run("a column used as a relation", func(t *testing.T) {
 			var notRelated []string
 
+			//antvet:ignore not a probe, on purpose: the test checks the error
 			_, err := db.Orphans.Include(&notRelated).All(ctx)
 			require.ErrorIs(t, err, ant.ErrNotProbe)
 		})

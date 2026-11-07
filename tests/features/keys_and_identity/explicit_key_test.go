@@ -44,6 +44,7 @@ func TestExplicitKey(t *testing.T) {
 		})
 
 		t.Run("the key type follows the configured field", func(t *testing.T) {
+			//antvet:ignore a key of the wrong type, on purpose: the test checks the error
 			_, err := db.Countries.Find(ctx, 1)
 			require.ErrorIs(t, err, ant.ErrKeyType)
 		})
