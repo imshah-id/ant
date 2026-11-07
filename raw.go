@@ -71,6 +71,15 @@ func (r *RawQuery[T]) rows(ctx context.Context) (*sql.Rows, error) {
 		return nil, err
 	}
 
+	// A row scans into the fields ant read of T, so a struct it could not read,
+	// as one with an embedded pointer, is an error, not rows with fields left
+	// empty.
+	if t := reflect.TypeFor[T](); !meta.IsValue(t) {
+		if err := meta.OfType(t).Err(); err != nil {
+			return nil, err
+		}
+	}
+
 	rows, err := s.exec.QueryContext(ctx, text, args...)
 	if err != nil {
 		return nil, err

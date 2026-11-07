@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/skudra-go/ant"
+	"github.com/skudra-go/ant/dialect/postgres"
 	"github.com/skudra-go/ant/tests/features/fixture"
 )
 
@@ -81,4 +82,42 @@ func TestEmbedded(t *testing.T) {
 			require.Equal(t, "2", got.Shipping.Zip)
 		})
 	})
+}
+
+// A field tagged embedded must be a struct value: a pointer, which could be nil,
+// is refused with an error that names the field, when the context opens, and so
+// is a raw query or a projection that would scan into such a struct, rather than
+// leaving the fields after it empty.
+type Courier struct {
+	ID    int64
+	Depot *Address `ant:"embedded,prefix=depot_"`
+	Name  string
+}
+
+type CouriersDB struct {
+	ant.Context
+	Couriers ant.Table[Courier]
+}
+
+func TestEmbeddedPointerIsRefused(t *testing.T) {
+	ctx := t.Context()
+
+	const named = "embedded field Courier.Depot must be a struct value"
+
+	_, err := ant.Wrap[CouriersDB](postgres.Dialect, nil)
+	require.ErrorContains(t, err, named)
+
+	db, err := ant.Wrap[ShopsDB](postgres.Dialect, nil)
+	require.NoError(t, err)
+
+	_, err = ant.Raw[Courier](db, "SELECT 1 AS id, 'x' AS name").All(ctx)
+	require.ErrorContains(t, err, named)
+
+	_, err = ant.Raw[Courier](db, "SELECT 1 AS id, 'x' AS name").First(ctx)
+	require.ErrorContains(t, err, named)
+
+	co := ant.Fields[Courier]()
+
+	_, err = ant.Project[Courier](db.Shops.Query(), ant.Into(&co.ID, &Sh.ID)).All(ctx)
+	require.ErrorContains(t, err, named)
 }

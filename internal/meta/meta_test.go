@@ -338,12 +338,19 @@ func TestEmbeddedFieldMustBeStructValue(t *testing.T) {
 					} `ant:"embedded"`
 				}]()
 			}
+
 			err := model.Err()
 			if err == nil || !strings.Contains(err.Error(), tc.name) {
 				t.Fatalf("got %v, want field %s in error", err, tc.name)
 			}
+
 			called := false
-			model.Configure(func() error { called = true; return nil })
+
+			model.Configure(func() error {
+				called = true
+
+				return nil
+			})
 
 			if called || model.Err() != err {
 				t.Fatal("configuration replaced invalid embedded-field error")

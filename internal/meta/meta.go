@@ -902,8 +902,14 @@ func walk(m *Model, t reflect.Type, offset uintptr, prefix, columnPrefix string)
 			continue
 		case tag.embedded:
 			if sf.Type.Kind() != reflect.Struct {
-				return fmt.Errorf("ant: embedded field %s.%s must be a struct value, got %s", m.Type.Name(), name, sf.Type)
+				return fmt.Errorf(
+					"ant: embedded field %s.%s must be a struct value, got %s",
+					m.Type.Name(),
+					name,
+					sf.Type,
+				)
 			}
+
 			if err := walk(m, sf.Type, off, name+".", columnPrefix+tag.prefix); err != nil {
 				return err
 			}
@@ -949,6 +955,7 @@ func walk(m *Model, t reflect.Type, offset uintptr, prefix, columnPrefix string)
 			pointer:   pointerTo(sf.Type),
 		})
 	}
+
 	return nil
 }
 

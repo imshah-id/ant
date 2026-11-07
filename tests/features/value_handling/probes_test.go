@@ -2512,12 +2512,13 @@ func TestProbeEmbeddedPointer(t *testing.T) {
 			}
 		}()
 
+		// A pointer is refused, with an error that names the field (#51).
 		db, err := ant.Open[prPtrEmbeddedDB](t.Context(), target.Dialect, target.DSN)
 		if err == nil {
 			db.Close()
 		}
 
-		t.Logf("Open: %v", err)
+		require.ErrorContains(t, err, "must be a struct value")
 	})
 }
 
@@ -4363,7 +4364,6 @@ var knownProbes = []struct {
 	},
 	{regexp.MustCompile(`^TestProbeOddKeys/postgres/(time_key|composite_key_with_a_time)`), "#49"},
 	{regexp.MustCompile(`^TestProbeCustomValuers/Lines_`), "#50"},
-	{regexp.MustCompile(`^TestProbeEmbeddedPointer$`), "#51"},
 	{regexp.MustCompile(`^TestProbePointScanFormats$`), "#52"},
 	{regexp.MustCompile(`^TestProbeScalars/ant\.UnixTime_epoch/`), "#53"},
 	{regexp.MustCompile(`^TestProbeNullTypes/sql\.Null\[uint64\]_high_bit/`), "#53"},

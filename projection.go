@@ -40,6 +40,14 @@ func Project[R any](q Selectable, mappings ...Mapping) *Projection[R] {
 	p := &Projection[R]{builder: q.base().cloned()}
 	model := configure[R]()
 
+	// R scans by its fields, so a struct ant could not read fails the projection
+	// once, rather than each of its mappings.
+	if err := model.Err(); err != nil {
+		p.fail(err)
+
+		mappings = nil
+	}
+
 	for _, m := range mappings {
 		switch {
 		case m.err != nil:
